@@ -12,6 +12,7 @@ import { apiFetch } from "./auth";
 
 export interface FulfillmentRow {
   fulfillment_id: number;
+  so_line_id?: number | null;
   customer_name?: string | null;
   so_number?: string | null;
   fg_sku_name?: string | null;
@@ -295,6 +296,40 @@ export async function createPlan(body: CreatePlanBody): Promise<CreatePlanRespon
     throw new Error(detail);
   }
   return (await res.json()) as CreatePlanResponse;
+}
+
+// ── Resolve SO lines → fulfillment rows ──────────────────────────────────
+//
+// Backs the SO-Creation "Selected for Plan" panel: the operator checks SO
+// article lines (so_line rows) and the panel needs the matching fulfillment
+// rows (fulfillment_id, pending qty, deadline, entity) to build a plan.
+// Read-only — never creates rows. The server returns the rows in the same
+// shape as listFulfillments plus the so_line_ids that have no fulfillment
+// row yet (not synced) so the caller can prompt the operator to run Sync.
+// Mirrors router.py:571 /fulfillment-v2/by-so-lines.
+
+export interface FulfillmentBySoLinesResponse {
+  results: FulfillmentRow[];
+  missing_so_line_ids: number[];
+}
+
+export async function fetchFulfillmentsBySoLines(
+  soLineIds: number[],
+  entity?: string,
+): Promise<FulfillmentBySoLinesResponse> {
+  const res = await apiFetch(`/api/v1/production/fulfillment-v2/by-so-lines`, {
+    method: "POST",
+    body: JSON.stringify({ so_line_ids: soLineIds, entity: entity || null }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const j = (await res.json()) as { detail?: string };
+      if (j.detail) detail = j.detail;
+    } catch { /* non-JSON */ }
+    throw new Error(detail);
+  }
+  return (await res.json()) as FulfillmentBySoLinesResponse;
 }
 
 // ── Deferred (typed only): BOM / floor-stock / carryforward ─────────────

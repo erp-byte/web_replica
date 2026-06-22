@@ -10,7 +10,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { useRequireAuth } from "@/lib/user";
+import { useRequireAuth, useUserScope } from "@/lib/user";
 import { useSeesCost } from "@/lib/cost-gate";
 import { friendlyApiError } from "@/lib/apiErrors";
 import {
@@ -24,9 +24,10 @@ import {
   type SoLineEntry,
   fetchSoExport,
   listSos,
-  syncFulfillment,
   uploadSoBook,
 } from "@/lib/so";
+import { fetchFulfillmentsBySoLines, fmtKg, fmtUnits, syncFulfillmentNow, type FulfillmentRow } from "@/lib/fulfillment";
+import { usePlanBuilder, SelectedArticlesPanel } from "@/lib/planBuilder";
 import {
   loadSoListCache,
   saveSoListCache,
@@ -46,7 +47,18 @@ type SortOrder = "asc" | "desc";
 
 function fmtDate(d?: string | null): string {
   if (!d) return "—";
-  try { return new Date(d).toLocaleDateString(); } catch { return d; }
+  // so_date arrives as an ISO "YYYY-MM-DD" string. Format it as D/M/YYYY
+  // (Indian convention) by reading the parts directly — going through
+  // new Date().toLocaleDateString() applies the runtime locale (en-US here →
+  // M/D/YYYY) and parses the bare date as UTC midnight, which can shift the
+  // day in non-UTC timezones.
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(d);
+  if (m) {
+    const [, y, mo, da] = m;
+    return `${parseInt(da, 10)}/${parseInt(mo, 10)}/${y}`;
+  }
+  // Fallback for any non-ISO value — still day-first (en-GB), never US order.
+  try { return new Date(d).toLocaleDateString("en-GB"); } catch { return d; }
 }
 
 function fmtNum(v: number | string | null | undefined, digits = 2): string {
@@ -75,9 +87,11 @@ function normaliseLines(raw: SoRow["lines"]): NormalisedLineEntry[] {
 // `optionKey` is what /view returns inside `filter_options`; the wire
 // `key` is what the listing query accepts. Backend ORs the comma-
 // separated values within a key and ANDs across keys.
+// Note: `customer_name` and `company` are intentionally NOT here — Customer is
+// a top-level toolbar dropdown and Company is the header entity segmented
+// control (All/CFPL/CDPL), so listing either in the Advanced panel too would
+// give two controls writing the same wire param.
 const ADV_FIELDS: { key: keyof SoListQuery; label: string; optionKey: keyof SoFilterOptions }[] = [
-  { key: "company",              label: "Company",        optionKey: "companies" },
-  { key: "customer_name",        label: "Customer",       optionKey: "customer_names" },
   { key: "common_customer_name", label: "Common Name",    optionKey: "common_customer_names" },
   { key: "voucher_type",         label: "Voucher Type",   optionKey: "voucher_types" },
   { key: "item_category",        label: "Item Category",  optionKey: "item_categories" },
@@ -221,6 +235,9 @@ export default function SoCreationPage() {
   // (team_leader, qc_inspector, floor_manager, viewer) get no ₹ chrome
   // anywhere on this page.
   const { seesCost } = useSeesCost();
+  // Auth scope (warehouses + floors) drives the plan-builder's factory /
+  // floor pickers, same as the planning page.
+  const scope = useUserScope();
 
   // Method picker visibility — once the operator commits to upload, hide it.
   const [showMethods, setShowMethods] = useState(true);
@@ -269,8 +286,24 @@ export default function SoCreationPage() {
     for (const [k, arr] of Object.entries(cache.advFilters)) {
       out[k] = new Set(arr);
     }
+    // Customer and Company moved out of Advanced (top-level dropdown / entity
+    // selector) — drop any stale keys left in a pre-existing cache so two
+    // controls never both push the same param onto the wire.
+    delete out["customer_name"];
+    delete out["company"];
     return out;
   });
+  // Entity scope — the SO equivalent of planning's entity selector. SO headers
+  // carry company ("CFPL"/"CDPL"), so a single-select All/CFPL/CDPL segmented
+  // control in the header drives the `company` filter. "" = All.
+  const [company, setCompany] = useState<string>(cache?.company ?? "");
+  // Planning-parity top-level toolbar filters (Customer / SO / Article) — each
+  // a prominent multi-select dropdown mirroring the planning page's filter bar,
+  // kept separate from advFilters (own cache keys) rather than buried in the
+  // Advanced panel.
+  const [customer, setCustomer] = useState<string[]>(cache?.customer ?? []);
+  const [soNumber, setSoNumber] = useState<string[]>(cache?.soNumber ?? []);
+  const [article, setArticle] = useState<string[]>(cache?.article ?? []);
   const [sortBy, setSortBy] = useState<SortBy>(cache?.sortBy ?? "so_date");
   const [sortOrder, setSortOrder] = useState<SortOrder>(cache?.sortOrder ?? "asc");
   const [page, setPage] = useState(cache?.page ?? 1);
@@ -284,10 +317,147 @@ export default function SoCreationPage() {
   const [uploadFileName, setUploadFileName] = useState("");
   const [uploadMsg, setUploadMsg] = useState<{ kind: "ok" | "warn" | "err"; text: string } | null>(null);
 
+  // Manual fulfillment sync (toolbar Sync button) ─────────────────────────
+  // First step of the model-merge work: a visible manual control that pushes
+  // SO lines into so_fulfillment_v2, mirroring the Planning page's Sync and
+  // the auto-sync that already fires after an Excel upload. The SO listing on
+  // this page doesn't change on sync (it reads so_header/so_line; the sync
+  // writes downstream), so we only surface a result count — no refetch.
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  // Bumped after every sync so the per-line pending effect in SoLineDetail
+  // (keyed only on the line ids, which a sync doesn't change) re-fetches the
+  // freshly synced pending kg/pcs instead of showing stale figures until the
+  // row is collapsed and re-expanded.
+  const [syncVersion, setSyncVersion] = useState(0);
+
   // Expanded SOs (inline detail rows) ────────────────────────────────────
   const [expanded, setExpanded] = useState<Set<number>>(() =>
     new Set(cache?.expanded ?? []),
   );
+
+  // ── Plan builder ("Selected for Plan") ──────────────────────────────────
+  //
+  // Same per-article plan-builder the Planning page hosts, fed by the SO
+  // article checkboxes. A plan is scoped to ONE entity; the SO entity
+  // selector filters by company, so Create Plan effectively requires CFPL
+  // or CDPL (matches planning — "All" toasts to pick an entity).
+  const pb = usePlanBuilder({
+    entity: (company ? company.toLowerCase() : "") as "" | "cfpl" | "cdpl",
+    scope,
+    onToast: (m) => setSyncMsg({ kind: "ok", text: m }),
+  });
+  // Page-level article selection lifted out of SoLineDetail so the checkbox
+  // state survives a collapse and bridges to the plan-builder. Keyed by
+  // so_line_id.
+  // Rehydrated from the session cache so a refresh / back-nav keeps an
+  // in-progress plan's article checkboxes ticked (the panel cards are
+  // re-fed into the plan-builder by the rehydration effect below).
+  const [selectedLineIds, setSelectedLineIds] = useState<Set<number>>(
+    () => new Set(cache?.selectedLineIds ?? []),
+  );
+  // so_line_id → fulfillment_id, so unchecking can find the right card to
+  // drop from the plan-builder. Resolved on check via fetchFulfillmentsBySoLines;
+  // serialized as [so_line_id, fulfillment_id] pairs in the cache.
+  const [lineToFulfillment, setLineToFulfillment] = useState<Map<number, number>>(
+    () => new Map(cache?.lineToFulfillment ?? []),
+  );
+
+  // Check / uncheck an article. On check, resolve the SO line to its
+  // fulfillment row and hand it to the plan-builder; if the line hasn't been
+  // synced into fulfillment yet, prompt a Sync and leave the box unchecked.
+  // On uncheck, drop the card from the plan-builder + the bridge map.
+  async function onToggleLine(soLineId: number, line: SoLine) {
+    if (selectedLineIds.has(soLineId)) {
+      const fid = lineToFulfillment.get(soLineId);
+      if (fid != null) pb.deselect(fid);
+      setLineToFulfillment((m) => {
+        if (!m.has(soLineId)) return m;
+        const nm = new Map(m);
+        nm.delete(soLineId);
+        return nm;
+      });
+      setSelectedLineIds((s) => {
+        const n = new Set(s);
+        n.delete(soLineId);
+        return n;
+      });
+      return;
+    }
+    try {
+      const resp = await fetchFulfillmentsBySoLines(
+        [soLineId],
+        company ? company.toLowerCase() : undefined,
+      );
+      const row = resp.results[0];
+      if (!row) {
+        const name = line.sku_name ? `“${line.sku_name}” ` : "";
+        setSyncMsg({ kind: "err", text: `Run Sync first — ${name}isn't in fulfillment yet.` });
+        return;
+      }
+      pb.selectRow(row);
+      setLineToFulfillment((m) => {
+        const nm = new Map(m);
+        nm.set(soLineId, row.fulfillment_id);
+        return nm;
+      });
+      setSelectedLineIds((s) => {
+        const n = new Set(s);
+        n.add(soLineId);
+        return n;
+      });
+    } catch (e) {
+      setSyncMsg({ kind: "err", text: `Couldn't resolve article: ${friendlyApiError(e)}` });
+    }
+  }
+
+  // Clear the page-level checkbox state to match the plan-builder. Called
+  // after Create Plan succeeds (the builder clears its own selection there),
+  // so the SO boxes don't stay ticked with an empty panel.
+  function clearLineSelection() {
+    setSelectedLineIds(new Set());
+    setLineToFulfillment(new Map());
+  }
+
+  // Switching entity (All/CFPL/CDPL) only re-scopes the listing — the
+  // in-progress selection is PRESERVED across the flip (per request). This is
+  // safe because the entity selector is now a pure filter: onCreatePlan derives
+  // the plan's entity from each selected row's own `entity` (every row was
+  // resolved with its entity at check time) and rejects a mixed CFPL+CDPL
+  // selection, so it can never POST the new entity linked to the old entity's
+  // fulfillment rows. Pagination still resets (different filtered set).
+  function onEntityChange(v: string) {
+    setCompany(v);
+    setPage(1);
+  }
+
+  // Rehydrate an in-progress plan selection from the session cache. The
+  // checkbox ids hydrate synchronously above, but the plan-builder's cards
+  // live in usePlanBuilder's own state — re-resolve the cached so_line_ids to
+  // their fulfillment rows and feed them back in so the panel matches the
+  // ticked boxes. Runs once after mount (entity-scoped to the cached company,
+  // which the cache also persisted).
+  useEffect(() => {
+    if (!mounted) return;
+    const cachedIds = cache?.selectedLineIds ?? [];
+    if (cachedIds.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const resp = await fetchFulfillmentsBySoLines(
+          cachedIds,
+          company ? company.toLowerCase() : undefined,
+        );
+        if (cancelled) return;
+        for (const r of resp.results) pb.selectRow(r);
+      } catch {
+        // Non-fatal — selection just won't rehydrate into the panel.
+      }
+    })();
+    return () => { cancelled = true; };
+    // Once on mount with the cached ids; pb.selectRow is referentially stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mounted]);
 
   // Debounce search ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -303,11 +473,26 @@ export default function SoCreationPage() {
   // statically analysable for react-hooks/exhaustive-deps.
   const advKey = advFilterKey(advFilters);
 
+  // Stable fingerprints of the top-level multi-selects — scalars the
+  // exhaustive-deps rule can track, same reasoning as advKey.
+  const customerKey = customer.join("|");
+  const soNumberKey = soNumber.join("|");
+  const articleKey = article.join("|");
+
   // Fingerprint of the expanded-rows Set for the cache-save effect dep
   // array. Sorted so equal-membership sets fingerprint identically.
   const expandedKey = useMemo(
     () => [...expanded].sort((a, b) => a - b).join(","),
     [expanded],
+  );
+
+  // Fingerprint of the in-progress plan selection for the cache-save effect
+  // dep array — re-fires the save when articles are checked/unchecked.
+  // lineToFulfillment changes in lockstep with selectedLineIds (both are
+  // written together in onToggleLine), so this one key tracks both.
+  const selectionKey = useMemo(
+    () => [...selectedLineIds].sort((a, b) => a - b).join(","),
+    [selectedLineIds],
   );
 
   // Persist the listing state on any change. Snapshot pattern (write the
@@ -323,17 +508,27 @@ export default function SoCreationPage() {
       dateFrom,
       dateTo,
       advFilters: advArrays,
+      company,
+      customer,
+      soNumber,
+      article,
       sortBy,
       sortOrder,
       page,
       expanded: [...expanded],
+      // In-progress plan selection — so a refresh / back-nav keeps the ticked
+      // articles and their resolved fulfillment ids (Sets/Maps dehydrate to
+      // arrays for JSON; hydrated back in the lazy initialisers above).
+      selectedLineIds: [...selectedLineIds],
+      lineToFulfillment: [...lineToFulfillment],
     });
-    // advKey + expandedKey are the stable fingerprints of advFilters /
-    // expanded — they re-fire the effect when membership changes without
-    // wiring the Set objects into the dep array (which would trip the
-    // exhaustive-deps rule).
+    // advKey + customerKey + soNumberKey + articleKey + expandedKey are the
+    // stable fingerprints of the Set/array filters — they re-fire the effect
+    // when membership changes without wiring the objects into the dep array
+    // (which would trip the exhaustive-deps rule). `company` is a plain string
+    // so it goes in directly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, status, dateFrom, dateTo, advKey, sortBy, sortOrder, page, expandedKey]);
+  }, [search, status, dateFrom, dateTo, company, advKey, customerKey, soNumberKey, articleKey, sortBy, sortOrder, page, expandedKey, selectionKey]);
 
   // Fetch effect ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -355,6 +550,10 @@ export default function SoCreationPage() {
             date_from: dateFrom || undefined,
             date_to: dateTo || undefined,
             ...serialiseAdvFilters(advFilters),
+            company: company || undefined,
+            customer_name: customer.length ? customer.join(",") : undefined,
+            so_number: soNumber.length ? soNumber.join(",") : undefined,
+            article: article.length ? article.join(",") : undefined,
           },
           controller.signal,
         );
@@ -374,7 +573,7 @@ export default function SoCreationPage() {
     // wiring the Set map itself into the dep array (which would trip the
     // exhaustive-deps rule).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authed, page, debouncedSearch, status, sortBy, sortOrder, dateFrom, dateTo, advKey]);
+  }, [authed, page, debouncedSearch, status, sortBy, sortOrder, dateFrom, dateTo, company, advKey, customerKey, soNumberKey, articleKey]);
 
   // Status chip change resets page. Same as filter changes in the listing.
   function changeStatus(s: StatusChip) {
@@ -411,9 +610,11 @@ export default function SoCreationPage() {
       const r = await uploadSoBook(file);
       const total = r.summary?.total_sos ?? 0;
       setUploadMsg({ kind: "ok", text: `Processed ${total} Sales Order${total === 1 ? "" : "s"}.` });
-      // Auto-sync fulfillment. Non-fatal on failure.
+      // Auto-sync fulfillment across all entities — a freshly uploaded book
+      // can span CFPL/CDPL, so this stays entity-wide regardless of the
+      // header scope. Non-fatal on failure.
       try {
-        const sd = await syncFulfillment();
+        const sd = await syncFulfillmentNow();
         const synced = sd.synced ?? sd.summary?.synced ?? 0;
         if (synced > 0) {
           setUploadMsg({ kind: "ok", text: `Processed ${total} SO${total === 1 ? "" : "s"} · synced ${synced} fulfillment line${synced === 1 ? "" : "s"}.` });
@@ -476,6 +677,33 @@ export default function SoCreationPage() {
     }
   }
 
+  // Push SO lines into so_fulfillment_v2. Calls the idempotent
+  // /fulfillment-v2/sync, same endpoint as the post-upload auto-sync and the
+  // Planning page's Sync button — but scoped to the selected entity so a
+  // CFPL/CDPL view doesn't churn the other entity's rows (matches the page's
+  // own entity scoping). The guard drops a second click while in flight; the
+  // syncVersion bump refreshes the per-line pending shown in expanded rows.
+  async function onSync() {
+    if (syncing) return;
+    setSyncing(true);
+    setSyncMsg(null);
+    try {
+      const r = await syncFulfillmentNow(company ? company.toLowerCase() : undefined);
+      const synced = r.synced ?? r.summary?.synced ?? 0;
+      setSyncMsg({
+        kind: "ok",
+        text: synced
+          ? `Synced ${synced} fulfillment line${synced === 1 ? "" : "s"}.`
+          : "Sync complete — nothing new to sync.",
+      });
+    } catch (e) {
+      setSyncMsg({ kind: "err", text: `Sync failed: ${friendlyApiError(e)}` });
+    } finally {
+      setSyncVersion((v) => v + 1);
+      setSyncing(false);
+    }
+  }
+
   if (!mounted) {
     return (
       <SoChrome title="SO Creation">
@@ -494,11 +722,36 @@ export default function SoCreationPage() {
       <div className="mb-3">
         <BackLink parentHref="/modules/production" label="production" />
       </div>
-      <div className="mb-5">
-        <h1 className="text-[22px] leading-[28px] font-semibold text-[var(--text-primary)]">SO Creation</h1>
-        <p className="text-[13px] text-[var(--text-secondary)] mt-1">
-          Create Sales Orders manually or upload a Sales Register file.
-        </p>
+      <div className="mb-5 flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-[22px] leading-[28px] font-semibold text-[var(--text-primary)]">SO Creation</h1>
+          <p className="text-[13px] text-[var(--text-secondary)] mt-1">
+            Create Sales Orders manually or upload a Sales Register file.
+          </p>
+        </div>
+        {/* Entity scope (company) — mirrors the planning page's entity selector;
+            "" = All, else filters so_header.company to CFPL/CDPL. The Create
+            Plan button mirrors planning's header CTA: orange, disabled with no
+            selection or while a plan is in flight. */}
+        <div className="flex items-center gap-2 shrink-0">
+          <EntitySelector value={company} onChange={onEntityChange} />
+          <button
+            type="button"
+            onClick={async () => { if (await pb.onCreatePlan()) clearLineSelection(); }}
+            disabled={pb.creatingPlan || pb.selectedIds.size === 0}
+            className="h-8 px-3 text-[12px] rounded-[2px] font-semibold border bg-[var(--aws-orange)] border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
+          >
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2}>
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+            {pb.creatingPlan
+              ? "Creating…"
+              : pb.selectedIds.size > 0
+                ? `Create Plan · ${pb.selectedIds.size}`
+                : "Create Plan"}
+          </button>
+        </div>
       </div>
 
       {showMethods ? (
@@ -548,17 +801,92 @@ export default function SoCreationPage() {
           setPage(1);
         }}
         onAdvClear={() => { setAdvFilters({}); setPage(1); }}
+        customer={customer}
+        onCustomerChange={(v) => { setCustomer(v); setPage(1); }}
+        soNumber={soNumber}
+        onSoNumberChange={(v) => { setSoNumber(v); setPage(1); }}
+        article={article}
+        onArticleChange={(v) => { setArticle(v); setPage(1); }}
         onClearAllFilters={() => {
           setSearch("");
           setStatus("all");
           setDateFrom("");
           setDateTo("");
           setAdvFilters({});
+          setCustomer([]);
+          setSoNumber([]);
+          setArticle([]);
           setPage(1);
         }}
         filterOptions={data?.filter_options}
         onExport={onExport}
         onRefresh={() => { setExpanded(new Set()); setPage(1); }}
+        onSync={onSync}
+        syncing={syncing}
+      />
+
+      {syncMsg ? (
+        <div
+          className={[
+            "mb-3 text-[12px]",
+            syncMsg.kind === "ok" ? "text-[var(--text-success)]" : "text-[var(--aws-error)]",
+          ].join(" ")}
+        >
+          {syncMsg.text}
+        </div>
+      ) : null}
+
+      {/* Selected-for-plan panel — same plan-builder the planning page hosts,
+          fed by the SO article checkboxes below. Renders nothing when no
+          articles are checked. */}
+      <SelectedArticlesPanel
+        selectedIds={pb.selectedIds}
+        rowsCache={pb.selectedRowsCache}
+        cardCfg={pb.cardCfg}
+        expandedCardId={pb.expandedCardId}
+        scope={scope}
+        factoryOpts={pb.factoryOpts}
+        onToggleExpand={(id) => {
+          pb.setExpandedCardId((c) => (c === id ? null : id));
+          // Fire-and-forget; early-returns if the BOM is already loaded or in
+          // flight. Idempotent on repeat expand.
+          void pb.ensureStepsLoaded(id);
+        }}
+        onPatch={pb.patchCardOverride}
+        onReset={pb.resetCardOverride}
+        onRemove={(id) => {
+          // Removing a card from the panel must also clear the SO checkbox.
+          const entry = [...lineToFulfillment.entries()].find(([, fid]) => fid === id);
+          if (entry) {
+            const soLineId = entry[0];
+            setLineToFulfillment((m) => {
+              const nm = new Map(m);
+              nm.delete(soLineId);
+              return nm;
+            });
+            setSelectedLineIds((s) => {
+              const n = new Set(s);
+              n.delete(soLineId);
+              return n;
+            });
+          }
+          pb.deselect(id);
+        }}
+        onClearAll={() => {
+          pb.clearAllSelection();
+          setSelectedLineIds(new Set());
+          setLineToFulfillment(new Map());
+        }}
+        onSetFactory={pb.setCardFactory}
+        onSetStepFloor={pb.setCardStepFloor}
+        onSetStepProcess={pb.setCardStepProcess}
+        onMoveStep={pb.moveCardStep}
+        onMergeSteps={pb.mergeCardSteps}
+        onAddStep={pb.addCardStep}
+        onRemoveStep={pb.removeCardStep}
+        onRefreshSteps={pb.refreshCardSteps}
+        // SFG stage drives routing here — no hand-edited process route.
+        showSteps={false}
       />
 
       {(data?.sales_orders?.length ?? 0) > 0 ? (
@@ -588,6 +916,9 @@ export default function SoCreationPage() {
         expanded={expanded}
         onToggle={toggleExpanded}
         seesCost={seesCost}
+        selectedLineIds={selectedLineIds}
+        onToggleLine={onToggleLine}
+        syncVersion={syncVersion}
         onEditHeader={(soId) => router.push(`/modules/production/so-creation/manual-update/${soId}?section=header`)}
         onEditLines={(soId) => router.push(`/modules/production/so-creation/manual-update/${soId}?section=lines`)}
       />
@@ -733,9 +1064,13 @@ function Toolbar({
   search, onSearch, status, onStatus, summary,
   dateFrom, dateTo, onDateChange,
   advFilters, onAdvToggle, onAdvClear,
+  customer, onCustomerChange,
+  soNumber, onSoNumberChange,
+  article, onArticleChange,
   onClearAllFilters,
   filterOptions,
   onExport, onRefresh,
+  onSync, syncing,
 }: {
   search: string;
   onSearch: (v: string) => void;
@@ -748,10 +1083,18 @@ function Toolbar({
   advFilters: Record<string, Set<string>>;
   onAdvToggle: (field: string, value: string) => void;
   onAdvClear: () => void;
+  customer: string[];
+  onCustomerChange: (v: string[]) => void;
+  soNumber: string[];
+  onSoNumberChange: (v: string[]) => void;
+  article: string[];
+  onArticleChange: (v: string[]) => void;
   onClearAllFilters: () => void;
   filterOptions?: SoFilterOptions;
   onExport: (only?: "mismatch" | "warning") => void;
   onRefresh: () => void;
+  onSync: () => void;
+  syncing: boolean;
 }) {
   const [dateOpen, setDateOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
@@ -761,7 +1104,14 @@ function Toolbar({
   const dateActive = !!dateFrom || !!dateTo;
   const statusActive = status !== "all";
   const searchActive = search.trim().length > 0;
-  const hasAnyFilter = advCount > 0 || dateActive || statusActive || searchActive;
+  const customerActive = customer.length > 0;
+  const soNumberActive = soNumber.length > 0;
+  const articleActive = article.length > 0;
+  const hasAnyFilter = advCount > 0 || dateActive || statusActive || searchActive
+    || customerActive || soNumberActive || articleActive;
+  const activeFilterCount =
+    advCount + (dateActive ? 1 : 0) + (statusActive ? 1 : 0) + (searchActive ? 1 : 0)
+    + (customerActive ? 1 : 0) + (soNumberActive ? 1 : 0) + (articleActive ? 1 : 0);
 
   const chips: { value: StatusChip; label: string; count?: number; tone?: string }[] = [
     { value: "all",       label: "All" },
@@ -820,11 +1170,57 @@ function Toolbar({
           type="button"
           onClick={onClearAllFilters}
           className="h-8 px-3 text-[12px] rounded-full border border-[var(--aws-error)] text-[var(--aws-error)] bg-[#fdf3f1] hover:bg-[#f8dde1] flex items-center gap-1.5"
-          title={`${advCount + (dateActive ? 1 : 0) + (statusActive ? 1 : 0) + (searchActive ? 1 : 0)} active filter${advCount + (dateActive ? 1 : 0) + (statusActive ? 1 : 0) + (searchActive ? 1 : 0) === 1 ? "" : "s"}`}
+          title={`${activeFilterCount} active filter${activeFilterCount === 1 ? "" : "s"}`}
         >
           <span>✕</span> Clear filters
         </button>
       ) : null}
+
+      {/* Planning-parity filter trio: Customer / SO / Article. Mirrors the
+          planning page's filter bar; each is backed by its filter_options list
+          and OR-ed within the field server-side. */}
+      <MultiSelect
+        triggerLabel="All Customers"
+        selectedLabel="customer"
+        selectedLabelPlural="customers"
+        options={filterOptions?.customer_names ?? []}
+        value={customer}
+        onChange={onCustomerChange}
+        placeholder="Search customer…"
+        icon={
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" />
+          </svg>
+        }
+      />
+      <MultiSelect
+        triggerLabel="All SOs"
+        selectedLabel="SO"
+        selectedLabelPlural="SOs"
+        options={filterOptions?.so_numbers ?? []}
+        value={soNumber}
+        onChange={onSoNumberChange}
+        placeholder="Search SO number…"
+        icon={
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" />
+          </svg>
+        }
+      />
+      <MultiSelect
+        triggerLabel="All Articles"
+        selectedLabel="article"
+        selectedLabelPlural="articles"
+        options={filterOptions?.articles ?? []}
+        value={article}
+        onChange={onArticleChange}
+        placeholder="Search article…"
+        icon={
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" /><line x1="7" y1="7" x2="7.01" y2="7" />
+          </svg>
+        }
+      />
 
       {/* Advanced filter */}
       <div className="relative">
@@ -906,6 +1302,22 @@ function Toolbar({
         ) : null}
       </div>
 
+      {/* Sync — pushes SO lines into so_fulfillment_v2 (idempotent). Uses a
+          distinct exchange glyph so it doesn't read as a second Refresh sitting
+          right beside the circular-arrows Refresh button. */}
+      <button
+        type="button"
+        onClick={onSync}
+        disabled={syncing}
+        className="h-8 px-3 text-[12px] rounded-[2px] border border-[var(--aws-border-strong)] bg-white hover:border-[var(--aws-navy)] flex items-center gap-1.5 disabled:opacity-50"
+        title="Sync Sales Order lines into fulfillment (so_fulfillment_v2)"
+      >
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className={syncing ? "animate-spin" : ""}>
+          <polyline points="17 1 21 5 17 9" /><path d="M3 11V9a4 4 0 0 1 4-4h14" /><polyline points="7 23 3 19 7 15" /><path d="M21 13v2a4 4 0 0 1-4 4H3" />
+        </svg>
+        {syncing ? "Syncing…" : "Sync"}
+      </button>
+
       <button
         type="button"
         onClick={onRefresh}
@@ -916,6 +1328,162 @@ function Toolbar({
         </svg>
         Refresh
       </button>
+    </div>
+  );
+}
+
+// ── Article multi-select ───────────────────────────────────────────────────
+//
+// Searchable, checkbox multi-select dropdown — the SO-toolbar twin of the
+// planning page's "All Articles" selector (planning/page.tsx `MultiSelect`).
+// Restyled to this toolbar's h-8 buttons and orange active accent so it sits
+// flush with Advanced / Date / Export. Options come from filter_options.articles
+// (distinct so_line.sku_name); selection is OR-ed within the field server-side.
+
+function MultiSelect({
+  triggerLabel, selectedLabel, selectedLabelPlural,
+  options, value, onChange, placeholder, icon,
+}: {
+  triggerLabel: string;
+  selectedLabel: string;
+  selectedLabelPlural: string;
+  options: string[];
+  value: string[];
+  onChange: (v: string[]) => void;
+  placeholder: string;
+  icon?: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function onDoc(e: MouseEvent) {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, []);
+
+  const visible = useMemo(() => {
+    const lc = q.trim().toLowerCase();
+    if (!lc) return options;
+    return options.filter((o) => o.toLowerCase().includes(lc));
+  }, [q, options]);
+
+  function toggle(v: string) {
+    onChange(value.includes(v) ? value.filter((x) => x !== v) : [...value, v]);
+  }
+
+  const active = value.length > 0;
+  // Reuse the singular noun at count 1 ("1 article") to avoid the awkward
+  // "1 articles" plural — mirrors the planning selector's label logic.
+  const renderedLabel = value.length === 0
+    ? triggerLabel
+    : value.length === 1
+      ? `1 ${selectedLabel}`
+      : `${value.length} ${selectedLabelPlural}`;
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={[
+          "h-8 px-3 text-[12px] rounded-[2px] border flex items-center gap-1.5 max-w-[220px]",
+          active
+            ? "border-[var(--aws-orange)] text-[var(--aws-orange)] bg-[#fbeced]"
+            : "border-[var(--aws-border-strong)] bg-white text-[var(--text-primary)] hover:border-[var(--aws-navy)]",
+        ].join(" ")}
+        title={active ? value.join(", ") : triggerLabel}
+      >
+        {icon}
+        <span className="truncate">{renderedLabel}</span>
+        {active ? (
+          <span className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] rounded-full font-bold bg-[var(--aws-orange)] text-white">
+            {value.length}
+          </span>
+        ) : null}
+        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth={2}>
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
+      {open ? (
+        <div className="absolute z-20 mt-1 w-[260px] max-w-[calc(100vw-1rem)] bg-white border border-[var(--aws-border)] rounded-md shadow-[0_4px_12px_rgba(0,28,36,0.18)] p-2">
+          <input
+            autoFocus
+            type="search"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder={placeholder}
+            className="w-full h-8 px-2 mb-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+          />
+          <div className="max-h-[280px] overflow-y-auto">
+            {visible.length === 0 ? (
+              <p className="text-[12px] text-[var(--text-muted)] italic p-2">No matches.</p>
+            ) : visible.map((opt) => {
+              const checked = value.includes(opt);
+              return (
+                <label
+                  key={opt}
+                  className="flex items-center gap-2 px-2 py-1.5 text-[13px] hover:bg-[var(--surface-subtle)] rounded-sm cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggle(opt)}
+                    className="accent-[var(--aws-orange)]"
+                  />
+                  <span className="truncate" title={opt}>{opt}</span>
+                </label>
+              );
+            })}
+          </div>
+          {value.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="w-full mt-1 px-2 py-1 text-[12px] text-[var(--aws-link)] hover:underline text-left"
+            >
+              Clear selection
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ── Entity selector (segmented control) ───────────────────────────────────
+//
+// The SO-header twin of the planning page's entity selector. SOs carry an
+// entity via `company` ("CFPL"/"CDPL"), so this single-select All/CFPL/CDPL
+// control drives the `company` filter. Uppercase values match so_header.company.
+
+function EntitySelector({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const opts: { v: string; label: string }[] = [
+    { v: "",     label: "All" },
+    { v: "CFPL", label: "CFPL" },
+    { v: "CDPL", label: "CDPL" },
+  ];
+  return (
+    <div className="flex items-center bg-white border border-[var(--aws-border-strong)] rounded-[2px] overflow-hidden shrink-0">
+      {opts.map((o, i) => (
+        <button
+          key={o.v || "all"}
+          type="button"
+          onClick={() => onChange(o.v)}
+          className={[
+            "h-8 px-3 text-[12px] font-medium transition-colors",
+            i > 0 ? "border-l border-[var(--aws-border)]" : "",
+            value === o.v
+              ? "bg-[var(--aws-navy)] text-white"
+              : "bg-white text-[var(--text-secondary)] hover:bg-[var(--surface-subtle)]",
+          ].join(" ")}
+        >
+          {o.label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -1028,7 +1596,9 @@ function AdvancedFilterPanel({
 
 function SoTable({
   rows, loading, error, sortBy, sortOrder, onSort,
-  expanded, onToggle, seesCost, onEditHeader, onEditLines,
+  expanded, onToggle, seesCost,
+  selectedLineIds, onToggleLine, syncVersion,
+  onEditHeader, onEditLines,
 }: {
   rows: SoRow[];
   loading: boolean;
@@ -1043,6 +1613,12 @@ function SoTable({
   // both the mobile-card branch and the desktop-table branch read the
   // same value.
   seesCost: boolean;
+  // Page-level article selection (so_line_id) + toggler — threaded down to
+  // every LineCard so the checkbox state feeds the plan-builder panel.
+  selectedLineIds: Set<number>;
+  onToggleLine: (soLineId: number, line: SoLine) => void;
+  // Bumped on every Sync so each expanded SO's pending-qty effect re-fetches.
+  syncVersion: number;
   onEditHeader: (soId: number) => void;
   onEditLines: (soId: number) => void;
 }) {
@@ -1077,6 +1653,9 @@ function SoTable({
               isOpen={row.so_id != null && expanded.has(row.so_id)}
               onToggle={() => row.so_id != null && onToggle(row.so_id)}
               seesCost={seesCost}
+              selectedLineIds={selectedLineIds}
+              onToggleLine={onToggleLine}
+              syncVersion={syncVersion}
               onEditHeader={() => row.so_id != null && onEditHeader(row.so_id)}
               onEditLines={() => row.so_id != null && onEditLines(row.so_id)}
             />
@@ -1126,6 +1705,9 @@ function SoTable({
                     isOpen={!!isOpen}
                     onToggle={() => row.so_id != null && onToggle(row.so_id)}
                     seesCost={seesCost}
+                    selectedLineIds={selectedLineIds}
+                    onToggleLine={onToggleLine}
+                    syncVersion={syncVersion}
                     onEditHeader={() => row.so_id != null && onEditHeader(row.so_id)}
                     onEditLines={() => row.so_id != null && onEditLines(row.so_id)}
                   />
@@ -1147,12 +1729,17 @@ function SoTable({
 // the same data into one card per SO with a tap-to-expand affordance.
 
 function SoMobileCard({
-  row, isOpen, onToggle, seesCost, onEditHeader, onEditLines,
+  row, isOpen, onToggle, seesCost,
+  selectedLineIds, onToggleLine, syncVersion,
+  onEditHeader, onEditLines,
 }: {
   row: SoRow;
   isOpen: boolean;
   onToggle: () => void;
   seesCost: boolean;
+  selectedLineIds: Set<number>;
+  onToggleLine: (soLineId: number, line: SoLine) => void;
+  syncVersion: number;
   onEditHeader: () => void;
   onEditLines: () => void;
 }) {
@@ -1213,7 +1800,13 @@ function SoMobileCard({
       </div>
       {isOpen ? (
         <div className="border-t border-[var(--aws-border)] p-3 bg-[var(--surface-subtle)]">
-          <SoLineDetail row={row} seesCost={seesCost} />
+          <SoLineDetail
+            row={row}
+            seesCost={seesCost}
+            selectedLineIds={selectedLineIds}
+            onToggleLine={onToggleLine}
+            syncVersion={syncVersion}
+          />
         </div>
       ) : null}
     </div>
@@ -1252,12 +1845,17 @@ function Th({
 }
 
 function SoTableRow({
-  row, isOpen, onToggle, seesCost, onEditHeader, onEditLines,
+  row, isOpen, onToggle, seesCost,
+  selectedLineIds, onToggleLine, syncVersion,
+  onEditHeader, onEditLines,
 }: {
   row: SoRow;
   isOpen: boolean;
   onToggle: () => void;
   seesCost: boolean;
+  selectedLineIds: Set<number>;
+  onToggleLine: (soLineId: number, line: SoLine) => void;
+  syncVersion: number;
   onEditHeader: () => void;
   onEditLines: () => void;
 }) {
@@ -1320,7 +1918,13 @@ function SoTableRow({
       {isOpen ? (
         <tr className="border-b border-[var(--aws-border)] bg-[var(--surface-subtle)]">
           <td colSpan={8} className="px-3 py-3" style={{ borderLeft: `3px solid ${palette.fg}` }}>
-            <SoLineDetail row={row} seesCost={seesCost} />
+            <SoLineDetail
+              row={row}
+              seesCost={seesCost}
+              selectedLineIds={selectedLineIds}
+              onToggleLine={onToggleLine}
+              syncVersion={syncVersion}
+            />
           </td>
         </tr>
       ) : null}
@@ -1372,11 +1976,57 @@ function GstSegBar({ row }: { row: SoRow }) {
   );
 }
 
-function SoLineDetail({ row, seesCost }: { row: SoRow; seesCost: boolean }) {
+function SoLineDetail({
+  row, seesCost, selectedLineIds, onToggleLine, syncVersion,
+}: {
+  row: SoRow;
+  seesCost: boolean;
+  // Page-level article selection (so_line_id) + toggler. Selection lives at
+  // the page level now so checkbox state survives a collapse and bridges to
+  // the plan-builder panel; checking the box selects only — it never expands
+  // the article (expansion is a separate "+" control on each LineCard).
+  selectedLineIds: Set<number>;
+  onToggleLine: (soLineId: number, line: SoLine) => void;
+  // Bumped by the page on each Sync — folded into the pending effect deps so a
+  // sync re-fetches this SO's pending qty instead of leaving it stale.
+  syncVersion?: number;
+}) {
   // Backend ships the list endpoint's `lines` as [{ line, gst_recon }] but
   // the detail endpoint ships a flat SoLine[]. normaliseLines() collapses
   // both into a single shape so the column readers don't have to branch.
   const entries = normaliseLines(row.lines);
+
+  // Fulfillment PENDING qty per line — resolve this SO's lines to their
+  // so_fulfillment_v2 rows so each LineCard can show pending kg/pcs. Scoped to
+  // the expanded SO (this component only mounts when the row is open), one
+  // batched lookup. Lines not yet synced to fulfillment show no pending.
+  const lineIdsKey = entries.map((e) => e.line.so_line_id ?? "").join(",");
+  const [pendingByLine, setPendingByLine] = useState<Map<number, FulfillmentRow>>(() => new Map());
+  useEffect(() => {
+    const ids = entries
+      .map((e) => e.line.so_line_id)
+      .filter((x): x is number => x != null);
+    if (ids.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const resp = await fetchFulfillmentsBySoLines(ids);
+        if (cancelled) return;
+        const m = new Map<number, FulfillmentRow>();
+        for (const r of resp.results) {
+          if (r.so_line_id != null) m.set(r.so_line_id, r);
+        }
+        setPendingByLine(m);
+      } catch {
+        // Non-fatal — pending just won't show for this SO.
+      }
+    })();
+    return () => { cancelled = true; };
+    // lineIdsKey is the stable fingerprint of the line so_line_ids; syncVersion
+    // re-fires the fetch after a Sync (which leaves the ids unchanged).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineIdsKey, syncVersion]);
+
   const meta: { label: string; value: string }[] = [
     { label: "Common customer", value: row.common_customer_name || "—" },
     { label: "Voucher type",    value: row.voucher_type || "—" },
@@ -1397,9 +2047,28 @@ function SoLineDetail({ row, seesCost }: { row: SoRow; seesCost: boolean }) {
         <p className="text-[12px] text-[var(--text-muted)] italic">No line items.</p>
       ) : (
         <div className="space-y-2">
-          {entries.map(({ line, gst_recon }, i) => (
-            <LineCard key={line.so_line_id ?? line.line_number ?? i} line={line} gst={gst_recon ?? null} seesCost={seesCost} />
-          ))}
+          {entries.map(({ line, gst_recon }, i) => {
+            // The plan-builder resolves a checked article through its
+            // so_line_id (the backend's by-so-lines lookup is keyed on it),
+            // so selection only works for lines that carry one. Lines without
+            // a so_line_id (shouldn't happen for backend rows) get a disabled
+            // checkbox. A stable render key still falls back to line_number /
+            // index so React keeps the list keyed.
+            const soLineId = line.so_line_id ?? null;
+            const key = soLineId ?? line.line_number ?? i;
+            return (
+              <LineCard
+                key={key}
+                line={line}
+                gst={gst_recon ?? null}
+                seesCost={seesCost}
+                pending={soLineId != null ? pendingByLine.get(soLineId) ?? null : null}
+                selected={soLineId != null && selectedLineIds.has(soLineId)}
+                selectable={soLineId != null}
+                onToggleSelect={() => { if (soLineId != null) onToggleLine(soLineId, line); }}
+              />
+            );
+          })}
         </div>
       )}
     </>
@@ -1415,25 +2084,53 @@ function SoLineDetail({ row, seesCost }: { row: SoRow; seesCost: boolean }) {
 //   4. GST Reconciliation (+ Excel-vs-Master compare table + checks),
 //      or "No GST Reconciliation" when gst_recon is null.
 
-function LineCard({ line, gst, seesCost }: { line: SoLine; gst: GstRecon | null; seesCost: boolean }) {
+function LineCard({
+  line, gst, seesCost, pending, selected, selectable, onToggleSelect,
+}: {
+  line: SoLine; gst: GstRecon | null; seesCost: boolean;
+  pending: FulfillmentRow | null;
+  selected: boolean; selectable: boolean; onToggleSelect: () => void;
+}) {
   const [open, setOpen] = useState(false);
   const status = (gst?.status ?? line.gst_status ?? (gst ? "ok" : "unmatched")) as string;
-  const palette = STATUS_PALETTE[status] ?? STATUS_PALETTE.unmatched;
   const isUnmatched = line.match_score == null || line.match_source == null;
+  // 3-colour line status: amber = RM sold (item_type 'rm', takes precedence),
+  // else green = GST ok, red = GST mismatch / warning. (Unmatched-with-no-recon
+  // falls to green per the agreed mapping.)
+  const isRm = (line.item_type ?? "").trim().toLowerCase() === "rm";
+  const tone: "green" | "amber" | "red" =
+    isRm ? "amber"
+      : (status === "mismatch" || status === "warning") ? "red"
+        : "green";
+  const chipPal = {
+    green: { fg: "var(--text-success)", bg: "#eaf6ed", ring: "#b6dbb1" },
+    amber: { fg: "#8a5a00",             bg: "#fef6e7", ring: "#f3d28a" },
+    red:   { fg: "#b1361e",             bg: "#fdf3f1", ring: "#f0c7be" },
+  }[tone];
+  const chipLabel = isRm ? "RM Sold" : String(status).replace(/_/g, " ");
 
   return (
     <div
       className={[
         "bg-white border rounded-md shadow-[0_1px_1px_rgba(0,28,36,0.10)] overflow-hidden",
         isUnmatched ? "border-[var(--text-muted)]" : "border-[var(--aws-border)]",
+        selected ? "ring-1 ring-[var(--aws-orange)]" : "",
       ].join(" ")}
     >
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="w-full text-left px-3 py-2 flex items-center gap-3 hover:bg-[var(--surface-subtle)]"
-        aria-expanded={open}
-      >
+      {/* Row header. Selection (checkbox) and expansion (+/− button) are
+          deliberately separate controls: checking the box only selects the
+          article — it never opens the detail. The detail opens solely via the
+          +/− button. */}
+      <div className="w-full px-3 py-2 flex items-center gap-3">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggleSelect}
+          disabled={!selectable}
+          title={selectable ? undefined : "This article has no SO line id — sync it first"}
+          className="accent-[var(--aws-orange)] w-4 h-4 shrink-0 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
+          aria-label={`Select ${line.sku_name || "article"}`}
+        />
         <span className="inline-flex items-center justify-center w-6 h-6 rounded-sm bg-[var(--surface-divider)] text-[11px] font-bold text-[var(--text-secondary)] shrink-0">
           {line.line_number ?? "?"}
         </span>
@@ -1447,6 +2144,18 @@ function LineCard({ line, gst, seesCost }: { line: SoLine; gst: GstRecon | null;
           {line.sku_name || "Unnamed Article"}
           {isUnmatched ? <span className="ml-2 text-[10px] uppercase tracking-wide font-semibold text-[var(--text-muted)]">Unmatched</span> : null}
         </span>
+        {/* Pending fulfillment qty (so_fulfillment_v2: ordered − dispatched).
+            Not cost data — shown for every role. Hidden on the narrowest
+            screens to keep the row from wrapping. Absent when the line isn't
+            synced to fulfillment yet. */}
+        {pending ? (
+          <span className="text-[11px] tabular-nums text-[var(--text-secondary)] shrink-0 hidden sm:inline" title="Pending (ordered − dispatched)">
+            {fmtKg(pending.pending_qty_kg)} kg
+            {pending.pending_qty_units != null ? (
+              <span className="text-[var(--text-muted)]"> · {fmtUnits(pending.pending_qty_units)} pcs</span>
+            ) : null}
+          </span>
+        ) : null}
         {/* C12: deny-list roles never see the ₹ chip on the row header.
             The status chip + line title still anchor the layout, so
             hiding this doesn't break the row alignment. */}
@@ -1457,12 +2166,26 @@ function LineCard({ line, gst, seesCost }: { line: SoLine; gst: GstRecon | null;
         ) : null}
         <span
           className="inline-block text-[10px] font-semibold px-2 py-0.5 rounded-sm capitalize shrink-0"
-          style={{ background: palette.bg, color: palette.fg, border: `1px solid ${palette.ring}` }}
+          style={{ background: chipPal.bg, color: chipPal.fg, border: `1px solid ${chipPal.ring}` }}
+          title={isRm ? "RM sold (raw material)" : `GST: ${String(status).replace(/_/g, " ")}`}
         >
-          {String(status).replace(/_/g, " ")}
+          {chipLabel}
         </span>
-        <span className={["text-[var(--text-muted)] transition-transform shrink-0", open ? "rotate-90" : ""].join(" ")} aria-hidden>▸</span>
-      </button>
+        {/* Expand / collapse the article detail — "+" when collapsed, "−" open. */}
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-label={open ? "Collapse article" : "Expand article"}
+          title={open ? "Collapse" : "Expand"}
+          className="inline-flex items-center justify-center w-6 h-6 rounded-sm border border-[var(--aws-border-strong)] text-[var(--text-secondary)] hover:border-[var(--aws-navy)] hover:text-[var(--aws-navy)] shrink-0"
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+            <line x1="5" y1="12" x2="19" y2="12" />
+            {!open ? <line x1="12" y1="5" x2="12" y2="19" /> : null}
+          </svg>
+        </button>
+      </div>
 
       {open ? (
         <div className="border-t border-[var(--aws-border)] p-3 bg-[var(--surface-subtle)] space-y-3">

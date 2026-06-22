@@ -28,6 +28,7 @@ import { useParams, useRouter } from "next/navigation";
 import { apiFetch, readApiErrorMessage, userStore } from "@/lib/auth";
 import { useIsAdmin, useMe, useRequireAuth, useUserInitial } from "@/lib/user";
 import { BALANCE_TOLERANCE_KG, WEIGHT_SAMPLE_COUNT } from "@/lib/constants";
+import { classifyProcess, classifySteps, STAGE_CREATE_WIP } from "@/lib/processCatalog";
 import { friendlyApiError } from "@/lib/apiErrors";
 import { BackLink } from "@/components/BackLink";
 import { LockBanner } from "../_LockBanner";
@@ -51,6 +52,8 @@ type ChainStep = {
   status: string | null;
   input_kind: string | null;
   output_kind: string | null;
+  input_code: string | null;   // SFG#### opened by this step (Slice 3 seam)
+  output_code: string | null;  // SFG#### produced by this step (Slice 3 seam)
   planned_qty_kg: number | null;
   carried_qty_kg: number | null;
   dispatched_to_next_kg: number | null;
@@ -68,7 +71,11 @@ type BomLine = {
   bom_line_id: number | null;
   line_number?: number | null;
   material_sku_name: string;
-  item_type: string | null; // 'RM' | 'PM'
+  // Canonical set: 'RM' | 'PM' | 'SFG' | 'FG' (case-normalised to UPPERCASE in
+  // the `articles` memo). SFG = a Semi-Finished/WIP intermediate carried between
+  // stages (item_type='sfg' in all_sku, Slice 1). Treated on the canonical-input
+  // (non-PM) side by the mass-balance predicates, same as RM.
+  item_type: string | null;
   uom?: string | null;
   quantity_per_unit?: number | null;
   loss_pct?: number | null;
@@ -154,6 +161,8 @@ type JobCardDetail = {
   plan_id: number | null;
   input_kind: string | null;
   output_kind: string | null;
+  input_code: string | null;   // SFG#### this stage consumes (Slice 3 seam)
+  output_code: string | null;  // SFG#### this stage produces (Slice 3 seam)
   start_time: string | null;
   end_time: string | null;
   total_time_min: number | string | null;
@@ -250,6 +259,16 @@ type JobCardDetail = {
    *  carried_in` — see jc_accounting_v2.save_accounting. */
   carried_qty_kg?: number | string | null;
 
+  /** G4 — Bar-Line Process override. The backend surfaces these on the JC
+   *  detail payload for bar-line VA products whose richer routing comes from
+   *  the `Bar Line Process` string. `bar_line_process` is that full routing
+   *  string; `bar_line_routed` flips TRUE once the G4 override actually rebuilt
+   *  this FG's route from it. Both are ADDITIVE + OPTIONAL — they may be absent
+   *  at runtime (built in a parallel backend slice), so every consumer must
+   *  treat them defensively and render nothing when they're missing. */
+  bar_line_process?: string | null;
+  bar_line_routed?: boolean;
+
   rm_indents?: IndentLine[];
   pm_indents?: IndentLine[];
   outputs?: Array<Record<string, unknown>>;
@@ -277,7 +296,7 @@ type JobCardDetail = {
 // Materials + Shifts (which existed on the web prototype) intentionally don't
 // have Android counterparts; the equivalent info lives inside Accounting
 // (BOM articles, consumption) and the toolbar/header time strip respectively.
-type TabKey = "chain" | "overview" | "accounting" | "quality" | "signoffs" | "remarks" | "amendments";
+type TabKey = "chain" | "overview" | "accounting" | "quality" | "signoffs" | "remarks" | "sfgboxes" | "amendments";
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "chain",      label: "Stage Chain" },
@@ -286,6 +305,7 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: "quality",    label: "Quality" },
   { key: "signoffs",   label: "Sign-offs" },
   { key: "remarks",    label: "Remarks" },
+  { key: "sfgboxes",   label: "SFG Boxes" },
   // Amendments tab hidden per operator request. The 'amendments' route
   // case is kept below so a stale ?tab=amendments URL doesn't 404, and
   // AmendmentsTab + the backend endpoints remain untouched — only the
@@ -932,6 +952,11 @@ function PageHeader({
           </h1>
           <p className="text-[13px] text-[var(--text-secondary)] mt-1">{detail.customer_name || "—"}</p>
 
+          {/* G4 — Bar-Line Process override. Renders only when the backend
+              surfaces a bar_line_process string (fields are additive/optional
+              and may be absent at runtime — see JobCardDetail). */}
+          <BarLineBadge detail={detail} />
+
           {/* Chain nav row — only when the JC is part of a chain. */}
           {cur && chain.length > 1 ? (
             <div className="flex items-center gap-2 mt-2 text-[12px]">
@@ -985,6 +1010,35 @@ function PageHeader({
         <HeaderMeta label="Plan" value={detail.plan_id ? `#${detail.plan_id}` : "—"} />
       </dl>
     </div>
+  );
+}
+
+// ── G4 Bar-Line Process badge ─────────────────────────────────────────────
+// Surfaces that this JC's FG is a bar-line VA product whose routing comes from
+// the richer `Bar Line Process` string. Two states:
+//   • bar_line_routed === true  → navy filled chip ("Bar Line"): the G4
+//     override actually rebuilt this FG's route from the richer process.
+//   • bar_line_process present but not routed → subtler outline chip
+//     ("Bar Line · not applied"): the richer routing exists but hasn't been
+//     applied yet, so ops can still see it.
+// Fully defensive: renders nothing when bar_line_process is absent/empty.
+// The full process string is exposed via the chip's `title` tooltip.
+function BarLineBadge({ detail }: { detail: JobCardDetail }) {
+  const process = detail.bar_line_process;
+  if (!process) return null;
+  const routed = detail.bar_line_routed === true;
+  return (
+    <span
+      title={process}
+      className={[
+        "inline-flex items-center gap-1 mt-2 rounded-sm px-1.5 py-0.5 text-[11px] font-semibold font-mono",
+        routed
+          ? "bg-[var(--aws-navy)] text-white border border-[var(--aws-navy)]"
+          : "bg-white text-[var(--aws-navy)] border border-[var(--aws-navy)] border-dashed",
+      ].join(" ")}
+    >
+      Bar Line{routed ? "" : <span className="font-normal text-[var(--text-secondary)]"> · not applied</span>}
+    </span>
   );
 }
 
@@ -1429,12 +1483,14 @@ function BatchBand({ detail, onReload }: { detail: JobCardDetail; onReload: () =
         const balMats   = detail.balance_materials ?? [];
         const bps       = detail.byproducts ?? [];
 
-        // RM-only consumption sum. PM rows excluded because they don't
-        // count toward FG mass balance.
+        // Input-side consumption sum. Only PM is excluded — packaging doesn't
+        // convert into FG mass; RM AND SFG/WIP opening inputs DO. (Slice 4: a
+        // Stage-2 / pack-of-existing-SFG card's only input is the SFG, so it must
+        // count here, matching the item_type !== 'PM' predicates elsewhere — else
+        // this client-side balance fallback reports the whole SFG input as a loss.)
         const rmConsumedSum = consLines.reduce((acc, c) => {
-          const isRm = (c.input_kind ?? "").toUpperCase() === "RM"
-            || (!c.input_kind && true);
-          return acc + (isRm && c.actual_consumed_qty != null
+          const isInput = (c.input_kind ?? "").toUpperCase() !== "PM";
+          return acc + (isInput && c.actual_consumed_qty != null
             ? Number(c.actual_consumed_qty) : 0);
         }, 0);
 
@@ -1469,7 +1525,15 @@ function BatchBand({ detail, onReload }: { detail: JobCardDetail; onReload: () =
           .filter(b => b.category === "control_sample")
           .reduce((a, b) => a + (b.qty_kg != null ? Number(b.qty_kg) : 0), 0);
 
-        const totalInput = rmConsumedSum;  // RM-only — matches AccountingTab rule
+        // Canonical input = RM issued (indents) + carried-in (chain SFG/WIP),
+        // falling back to non-PM consumption only when neither exists (archetype-C
+        // pack-of-existing-SFG). This matches the AccountingTab and avoids
+        // double-counting the chain SFG (carried_in) with the audit-only synthetic
+        // consumption row (Slice-5 review #4).
+        const rmIssuedKgSnap = (detail.rm_indents ?? []).reduce((a, r) => a + Number(r.issued_qty ?? 0), 0);
+        const carriedInSnap = Number(detail.carried_qty_kg ?? 0);
+        const canonicalInputSnap = rmIssuedKgSnap + carriedInSnap;
+        const totalInput = canonicalInputSnap > 0 ? canonicalInputSnap : rmConsumedSum;
         const totalAccounted = (fgKg ?? 0) + processLossKg + balMatTotal
                              + offgradeTotal + wastageKg + ctrlSampleKg
                              + (egaResolved ?? 0);
@@ -1965,7 +2029,115 @@ function OverflowMenu({ detail, onReload }: { detail: JobCardDetail; onReload: (
 // where the material is in the chain at a glance. The current step is
 // non-clickable; the others jump to their own detail page.
 
-function StageChainTab({ chain, onJump }: { chain: ChainStep[]; onJump: (id: number) => void }) {
+// Render one side of a step's material handoff. When a concrete SFG#### code is
+// present (a real Slice-3 2-stage seam) show it in mono so the operator sees the
+// code flowing JC1.output → JC2.input. Otherwise just show the kind — including a
+// plain "SFG" for a non-seam intermediate (every non-first step defaults to
+// input_kind='SFG' even on legacy multi-step chains that carry no code, so we
+// must NOT render those as "SFG ?"). Null kind falls back to "?".
+function SeamKind({ kind, code }: { kind: string | null; code: string | null }) {
+  if (code && (kind || "").toUpperCase() === "SFG") {
+    return <span className="font-mono font-semibold text-[var(--aws-navy)]">{code}</span>;
+  }
+  return <>{kind || "?"}</>;
+}
+
+// ── SFG inventory picker (Slice 5) ─────────────────────────────────────────
+// On a Final-FG / pack-of-existing-SFG stage that consumes an SFG####, lists the
+// AVAILABLE WIP/SFG batches (inventory_batch item_type='wip') its upstream
+// Create-WIP stage materialised on close — in FIFO order with expiry. "Use"
+// fills that batch's qty into the SFG consumption input (when the stage has an
+// SFG bom_line to record against; chain consumers auto-record via carried-in).
+type SfgBatch = {
+  batch_id: string;
+  sku_name: string | null;
+  current_qty_kg: number | null;
+  inward_date: string | null;
+  expiry_date: string | null;
+  floor_id: string | null;
+  status: string | null;
+};
+
+function SfgInventoryPicker({ sfgCode, entity, onUse }: { sfgCode: string; entity: string | null; onUse?: (qty: number) => void }) {
+  const [batches, setBatches] = useState<SfgBatch[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    if (!sfgCode || !entity) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch(
+          `/api/v1/production/job-cards-v2/sfg-inventory?sku_name=${encodeURIComponent(sfgCode)}&entity=${encodeURIComponent(entity)}`,
+        );
+        if (res.status === 401) return; // apiFetch redirected
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = (await res.json()) as { batches?: SfgBatch[] };
+        if (!cancelled) setBatches(json.batches ?? []);
+      } catch (e) {
+        if (!cancelled) setErr(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [sfgCode, entity]);
+
+  const total = (batches ?? []).reduce((s, b) => s + (b.current_qty_kg ?? 0), 0);
+  const todayIso = new Date().toISOString().slice(0, 10);
+
+  return (
+    <Panel title={`SFG inventory · ${sfgCode}`}>
+      {err ? (
+        <EmptyHint>Couldn’t load WIP stock ({err}).</EmptyHint>
+      ) : batches === null ? (
+        <EmptyHint>Loading WIP stock…</EmptyHint>
+      ) : batches.length === 0 ? (
+        <EmptyHint>No available WIP stock for {sfgCode} yet — it materialises when the upstream Create-WIP stage closes.</EmptyHint>
+      ) : (
+        <div className="space-y-1.5">
+          <div className="text-[12px] text-[var(--text-secondary)]">
+            {batches.length} batch{batches.length === 1 ? "" : "es"} · {fmtKg(total)} available (FIFO)
+          </div>
+          <ul className="space-y-1">
+            {batches.map((b) => {
+              const expired = !!b.expiry_date && b.expiry_date < todayIso;
+              return (
+                <li key={b.batch_id} className="flex items-center gap-2 rounded-md border border-[var(--aws-border)] bg-white p-2 text-[12px]">
+                  <span className="font-mono text-[11px] text-[var(--text-muted)]">{b.batch_id}</span>
+                  <span className="font-semibold">{fmtKg(b.current_qty_kg)}</span>
+                  <span className="text-[var(--text-muted)]">in {b.inward_date || "—"}</span>
+                  <span className={expired ? "text-[var(--text-danger)] font-medium" : "text-[var(--text-muted)]"}>
+                    exp {b.expiry_date || "—"}{expired ? " (expired)" : ""}
+                  </span>
+                  <span className="text-[var(--text-muted)]">{b.floor_id || "—"}</span>
+                  {onUse ? (
+                    <button
+                      type="button"
+                      onClick={() => onUse(b.current_qty_kg ?? 0)}
+                      className="ml-auto rounded border border-[var(--aws-navy)] px-2 py-0.5 text-[11px] text-[var(--aws-navy)] hover:bg-[var(--surface-divider)]"
+                    >
+                      Use
+                    </button>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function StageChainTab({ chain, detail, onJump }: { chain: ChainStep[]; detail: JobCardDetail; onJump: (id: number) => void }) {
+  // G4 — split the richer Bar-Line Process string into a read-only token
+  // sequence for reference. Defensive: only when the backend surfaced it.
+  // bar_line_process tokens are '+'-separated (e.g. "Receiving + Sorting + Roasting
+  // + …"), matching the backend's _split_process_category. Also tolerate >/→/,
+  // just in case, but '+' is the real delimiter.
+  const barLineTokens = (detail.bar_line_process || "")
+    .split(/[+>→,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+
   if (chain.length === 0) {
     return (
       <Panel>
@@ -1975,6 +2147,30 @@ function StageChainTab({ chain, onJump }: { chain: ChainStep[]; onJump: (id: num
   }
   return (
     <Panel title={`Stage chain · ${chain.length} ${chain.length === 1 ? "step" : "steps"}`}>
+      {barLineTokens.length > 0 ? (
+        <div className="mb-3 rounded-md border border-[var(--aws-border)] bg-[var(--surface-divider)] p-2.5">
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-[10px] uppercase tracking-wide font-semibold text-[var(--text-muted)]">
+              Bar Line Process
+            </span>
+            {detail.bar_line_routed === true ? (
+              <span className="text-[10px] font-semibold text-[var(--aws-navy)]">applied</span>
+            ) : (
+              <span className="text-[10px] font-medium text-[var(--text-secondary)]">not applied</span>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-1" title={detail.bar_line_process ?? ""}>
+            {barLineTokens.map((tok, i) => (
+              <span key={`${tok}-${i}`} className="inline-flex items-center gap-1">
+                {i > 0 ? <span className="text-[var(--text-muted)] text-[11px]">→</span> : null}
+                <span className="font-mono text-[11px] font-semibold text-[var(--aws-navy)] bg-white border border-[var(--aws-border)] rounded-sm px-1.5 py-0.5">
+                  {tok}
+                </span>
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
       <ol className="space-y-2">
         {chain.map((step) => (
           <li key={step.job_card_id}>
@@ -2003,7 +2199,12 @@ function StageChainTab({ chain, onJump }: { chain: ChainStep[]; onJump: (id: num
                     {step.process_name || "—"}
                   </div>
                   <div className="text-[12px] text-[var(--text-muted)] truncate">
-                    {step.stage || "—"} · {step.input_kind || "?"} → {step.output_kind || "?"} · {step.floor || "—"}
+                    {step.stage || "—"} ·{" "}
+                    <SeamKind kind={step.input_kind} code={step.input_code} />
+                    {" → "}
+                    <SeamKind kind={step.output_kind} code={step.output_code} />
+                    {" · "}
+                    {step.floor || "—"}
                   </div>
                 </div>
                 <StatusPill status={step.status} />
@@ -2073,14 +2274,506 @@ function TabPanel({
   onJumpJc: (id: number) => void;
 }) {
   switch (tab) {
-    case "chain":      return <StageChainTab chain={chain} onJump={onJumpJc} />;
+    case "chain":      return <StageChainTab chain={chain} detail={detail} onJump={onJumpJc} />;
     case "overview":   return <OverviewTab detail={detail} chain={chain} onReload={onReload} />;
     case "accounting": return <AccountingTab detail={detail} onReload={onReload} />;
     case "quality":    return <QualityTab detail={detail} onReload={onReload} />;
     case "signoffs":   return <SignOffsTab detail={detail} onReload={onReload} />;
     case "remarks":    return <RemarksTab detail={detail} onReload={onReload} />;
+    case "sfgboxes":   return <SfgBoxesTab detail={detail} />;
     case "amendments": return <AmendmentsTab jcId={detail.job_card_id} />;
   }
+}
+
+// ── SFG Boxes tab (Slice 6) ───────────────────────────────────────────────
+// Producer stages (output_kind SFG/WIP) split their net SFG into weighed boxes
+// and print one QR label per box; consumer stages (input_kind SFG) scan those
+// QRs to receive the SFG, with wrong-SFG / wrong-source / already-received boxes
+// rejected. box_id is the 8-digit numeric QR payload.
+
+type SfgBoxRow = {
+  box_id: number;
+  sfg_code: string | null;
+  box_number: number;
+  total_boxes: number;
+  net_weight: number;
+  gross_weight: number | null;
+  status: string;
+  received_into_job_card_id: number | null;
+  // Phase-7 genealogy additions (additive/optional; backend may not send yet)
+  lot_number?: string | null;
+  parent_box_id?: number | null;
+};
+
+// ── SFG genealogy (Phase 7) ───────────────────────────────────────────────
+// Fixed contract from the backend agent — these endpoints may not exist yet at
+// runtime, so every fetch is fully defensive (404 / empty ⇒ quiet "no data").
+type GenealogyBox = {
+  box_id: number;
+  sfg_code: string;
+  lot_number: string | null;
+  parent_box_id: number | null;
+  net_weight: number;
+  status: string;
+  source_inventory_batch_id: string | null;
+  job_card_id: number;
+  received_into_job_card_id: number | null;
+  source_job_card_id?: number | null;
+};
+
+type JcGenealogy = {
+  job_card_id: number;
+  produced: GenealogyBox[];
+  consumed: GenealogyBox[];
+};
+
+type ChainNode = {
+  level: number;
+  box_id: number | null;
+  sfg_code: string | null;
+  lot_number: string | null;
+  parent_box_id: number | null;
+  producer_job_card_id?: number | null;
+  source_inventory_batch_id: string | null;
+};
+
+type BoxGenealogy = {
+  box_id: number;
+  chain: ChainNode[];
+};
+
+type SfgScanResult = {
+  expected_sfg: string | null;
+  boxes_accepted: number;
+  boxes_rejected: number;
+  total_received_kg: number;
+  accepted_boxes: { box_id: number; sfg_code: string | null; net_weight: number }[];
+  rejected_boxes: { box_id: number | string; reason: string }[];
+};
+
+function SfgBoxesTab({ detail }: { detail: JobCardDetail }) {
+  const jcId = detail.job_card_id;
+  const isProducer = ["SFG", "WIP"].includes((detail.output_kind ?? "").toUpperCase());
+  const isConsumer = (detail.input_kind ?? "").toUpperCase() === "SFG";
+
+  const [boxes, setBoxes] = useState<SfgBoxRow[]>([]);
+  const [weights, setWeights] = useState<string[]>([""]);
+  const [creating, setCreating] = useState(false);
+  const [createErr, setCreateErr] = useState<string | null>(null);
+
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [scanText, setScanText] = useState("");
+  const [scanning, setScanning] = useState(false);
+  const [scanResult, setScanResult] = useState<SfgScanResult | null>(null);
+  const [scanErr, setScanErr] = useState<string | null>(null);
+
+  const loadBoxes = useCallback(async () => {
+    try {
+      const res = await apiFetch(`/api/v1/production/job-cards-v2/${jcId}/wip-boxes`);
+      if (!res.ok) { setLoadErr(await readApiErrorMessage(res, "Could not load boxes")); return; }
+      const data = (await res.json()) as { boxes?: SfgBoxRow[] };
+      setBoxes(data.boxes ?? []);
+      setLoadErr(null);
+    } catch (e) {
+      setLoadErr(friendlyJobCardError(e));
+    }
+  }, [jcId]);
+
+  useEffect(() => {
+    // Deferred past the synchronous effect body (react-hooks/set-state-in-effect)
+    // — the same queueMicrotask idiom used by useSeesCost / useMe in lib/.
+    queueMicrotask(() => { void loadBoxes(); });
+  }, [loadBoxes]);
+
+  const plannedNet = useMemo(
+    () => weights.reduce((s, w) => (Number(w) > 0 ? s + Number(w) : s), 0),
+    [weights],
+  );
+
+  async function openLabels() {
+    try {
+      const res = await apiFetch(`/api/v1/production/job-cards-v2/${jcId}/wip-boxes/labels.pdf`);
+      if (!res.ok) { setCreateErr(await readApiErrorMessage(res, "Could not open labels PDF")); return; }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      // noopener (matches the rest of the codebase). Popup blockers may stop a
+      // deferred open — the "Re-print labels" button is the direct-gesture path.
+      window.open(url, "_blank", "noopener");
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (e) {
+      setCreateErr(friendlyJobCardError(e));
+    }
+  }
+
+  async function createBoxes() {
+    const parsed = weights.map((w) => Number(w)).filter((n) => Number.isFinite(n) && n > 0);
+    if (parsed.length === 0) { setCreateErr("Enter at least one box weight (> 0)."); return; }
+    setCreating(true);
+    setCreateErr(null);
+    try {
+      const res = await apiFetch(`/api/v1/production/job-cards-v2/${jcId}/wip-boxes`, {
+        method: "POST",
+        body: JSON.stringify({ boxes: parsed.map((n) => ({ net_weight: n })) }),
+      });
+      if (!res.ok) { setCreateErr(await readApiErrorMessage(res, "Could not create boxes")); return; }
+      await loadBoxes();
+      setWeights([""]);
+      await openLabels();
+    } catch (e) {
+      setCreateErr(friendlyJobCardError(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function scanBoxes() {
+    const ids = scanText
+      .split(/[\s,]+/)
+      .map((t) => Number(t.trim()))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (ids.length === 0) { setScanErr("Enter one or more numeric box ids."); return; }
+    setScanning(true);
+    setScanErr(null);
+    setScanResult(null);
+    try {
+      const res = await apiFetch(`/api/v1/production/job-cards-v2/${jcId}/scan-sfg-boxes`, {
+        method: "POST",
+        body: JSON.stringify({ box_ids: ids }),
+      });
+      if (!res.ok) { setScanErr(await readApiErrorMessage(res, "Scan failed")); return; }
+      setScanResult((await res.json()) as SfgScanResult);
+      setScanText("");
+    } catch (e) {
+      setScanErr(friendlyJobCardError(e));
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  const btnCls =
+    "h-7 px-3 rounded-[2px] text-[12px] font-semibold border bg-[var(--aws-orange)] " +
+    "border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white " +
+    "disabled:opacity-50 disabled:cursor-not-allowed";
+
+  return (
+    <div className="space-y-4">
+      {!isProducer && !isConsumer && (
+        <EmptyHint>This stage neither produces nor consumes SFG — no boxes apply.</EmptyHint>
+      )}
+
+      {loadErr && (
+        <div className="text-[12px] text-[var(--aws-error)]">{loadErr}</div>
+      )}
+
+      {isProducer && (
+        <Panel title="Produce boxes & print QR labels">
+          <p className="text-[12px] text-[var(--text-secondary)] mb-3">
+            Split this stage&apos;s net SFG into weighed boxes. Each box gets an 8-digit QR id;
+            labels open as a PDF to print. Σ box weights should match the net SFG produced.
+          </p>
+          {boxes.length > 0 ? (
+            <div className="text-[13px] text-[var(--text-primary)] space-y-1">
+              <div className="font-semibold">
+                {boxes.length} box(es) · Σ {boxes.reduce((s, b) => s + Number(b.net_weight), 0).toFixed(3)} kg
+              </div>
+              <div className="grid grid-cols-12 gap-2 text-[11px] text-[var(--text-muted)] font-semibold">
+                <div className="col-span-3">Box ID</div>
+                <div className="col-span-1">#</div>
+                <div className="col-span-2">Net kg</div>
+                <div className="col-span-2">Lot</div>
+                <div className="col-span-2">Parent</div>
+                <div className="col-span-2">Status</div>
+              </div>
+              {boxes.map((b) => (
+                <div key={b.box_id} className="grid grid-cols-12 gap-2 text-[12px] items-center">
+                  <div className="col-span-3 font-mono">{b.box_id}</div>
+                  <div className="col-span-1">{b.box_number}/{b.total_boxes}</div>
+                  <div className="col-span-2">{Number(b.net_weight).toFixed(3)}</div>
+                  <div className="col-span-2 truncate">
+                    {b.lot_number ? <LotChip lot={b.lot_number} /> : <span className="text-[var(--text-muted)]">—</span>}
+                  </div>
+                  <div className="col-span-2 font-mono">
+                    {b.parent_box_id != null ? b.parent_box_id : <span className="text-[var(--text-muted)]">—</span>}
+                  </div>
+                  <div className="col-span-2 truncate">{b.status}</div>
+                </div>
+              ))}
+              <button type="button" className={`${btnCls} mt-2`} onClick={() => void openLabels()}>
+                Re-print labels
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {weights.map((w, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <span className="text-[12px] text-[var(--text-muted)] w-14">Box {i + 1}</span>
+                  <input
+                    type="number"
+                    step="any"
+                    inputMode="decimal"
+                    placeholder="net kg"
+                    className={`${inputCls} w-32`}
+                    value={w}
+                    onChange={(e) =>
+                      setWeights((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))
+                    }
+                  />
+                  {weights.length > 1 && (
+                    <button
+                      type="button"
+                      className="text-[12px] text-[var(--aws-error)] hover:underline"
+                      onClick={() => setWeights((prev) => prev.filter((_, j) => j !== i))}
+                    >
+                      remove
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="flex items-center gap-3 pt-1">
+                <button
+                  type="button"
+                  className="text-[12px] text-[var(--aws-link)] hover:underline"
+                  onClick={() => setWeights((prev) => [...prev, ""])}
+                >
+                  + add box
+                </button>
+                <span className="text-[12px] text-[var(--text-muted)]">
+                  Σ {plannedNet.toFixed(3)} kg
+                </span>
+              </div>
+              {createErr && <div className="text-[12px] text-[var(--aws-error)]">{createErr}</div>}
+              <button type="button" className={btnCls} disabled={creating} onClick={() => void createBoxes()}>
+                {creating ? "Creating…" : "Create boxes & print labels"}
+              </button>
+            </div>
+          )}
+        </Panel>
+      )}
+
+      {isConsumer && (
+        <Panel title="Scan SFG boxes in">
+          <p className="text-[12px] text-[var(--text-secondary)] mb-3">
+            Scan or enter the box QR ids arriving from the previous stage. A box is rejected if its
+            SFG or source job card doesn&apos;t match, or it was already received.
+          </p>
+          <textarea
+            className={`${inputCls} w-full h-20`}
+            placeholder="Box ids — space, comma or newline separated"
+            value={scanText}
+            onChange={(e) => setScanText(e.target.value)}
+          />
+          {scanErr && <div className="text-[12px] text-[var(--aws-error)] mt-1">{scanErr}</div>}
+          <button type="button" className={`${btnCls} mt-2`} disabled={scanning} onClick={() => void scanBoxes()}>
+            {scanning ? "Scanning…" : "Scan boxes"}
+          </button>
+          {scanResult && (
+            <div className="mt-3 text-[12px] space-y-1">
+              <div className="text-[var(--text-primary)] font-semibold">
+                {scanResult.boxes_accepted} accepted · {scanResult.boxes_rejected} rejected ·{" "}
+                {scanResult.total_received_kg.toFixed(3)} kg in
+              </div>
+              {scanResult.accepted_boxes.map((a) => (
+                <div key={a.box_id} className="text-[var(--text-success)]">
+                  ✓ {a.box_id} · {a.sfg_code} · {a.net_weight.toFixed(3)} kg
+                </div>
+              ))}
+              {scanResult.rejected_boxes.map((r, i) => (
+                <div key={`${r.box_id}-${i}`} className="text-[var(--aws-error)]">
+                  ✗ {r.box_id} — {r.reason}
+                </div>
+              ))}
+            </div>
+          )}
+        </Panel>
+      )}
+
+      <SfgGenealogyPanel jcId={jcId} />
+    </div>
+  );
+}
+
+// ── SFG genealogy panel (Phase 7) ─────────────────────────────────────────
+// Box→box→lot traceability for WIP SFG boxes. Two groups ("Produced here" /
+// "Consumed here") plus a per-box "Trace" expander that walks the upstream
+// chain. Fully defensive: a missing/empty endpoint shows a quiet hint, never
+// throws — the backend endpoints land in parallel and may 404 at runtime.
+
+function LotChip({ lot }: { lot: string }) {
+  return (
+    <span className="font-mono text-[11px] font-semibold text-[var(--aws-navy)] bg-[var(--surface-divider)] rounded-sm px-1.5 py-0.5">
+      {lot}
+    </span>
+  );
+}
+
+function SfgGenealogyPanel({ jcId }: { jcId: number }) {
+  const [data, setData] = useState<JcGenealogy | null>(null);
+  const [loading, setLoading] = useState(true);
+  // No visible error UI: a 404/parse failure simply resolves to the "no
+  // genealogy yet" empty state (the endpoint may not exist yet).
+  const [unavailable, setUnavailable] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await apiFetch(`/api/v1/production/job-cards-v2/${jcId}/sfg-genealogy`);
+      if (!res.ok) { setUnavailable(true); setData(null); return; }
+      const json = (await res.json()) as Partial<JcGenealogy> | null;
+      setData({
+        job_card_id: jcId,
+        produced: Array.isArray(json?.produced) ? json!.produced : [],
+        consumed: Array.isArray(json?.consumed) ? json!.consumed : [],
+      });
+      setUnavailable(false);
+    } catch {
+      setUnavailable(true);
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [jcId]);
+
+  useEffect(() => {
+    queueMicrotask(() => { void load(); });
+  }, [load]);
+
+  const produced = data?.produced ?? [];
+  const consumed = data?.consumed ?? [];
+  const empty = !loading && (unavailable || (produced.length === 0 && consumed.length === 0));
+
+  return (
+    <Panel title="Lot & box genealogy">
+      <p className="text-[12px] text-[var(--text-secondary)] mb-3">
+        Traceability for SFG boxes flowing through this job card — boxes produced
+        here and boxes consumed here, each traceable upstream box → lot → source
+        batch → producing job card.
+      </p>
+
+      {loading && <EmptyHint>Loading genealogy…</EmptyHint>}
+
+      {empty && <EmptyHint>No genealogy yet.</EmptyHint>}
+
+      {!loading && !empty && (
+        <div className="space-y-4">
+          <GenealogyGroup title="Produced here" boxes={produced} showSource={false} />
+          <GenealogyGroup title="Consumed here" boxes={consumed} showSource />
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function GenealogyGroup({
+  title, boxes, showSource,
+}: { title: string; boxes: GenealogyBox[]; showSource: boolean }) {
+  return (
+    <div>
+      <div className="text-[11px] uppercase tracking-wide font-semibold text-[var(--text-muted)] mb-1">
+        {title} · {boxes.length}
+      </div>
+      {boxes.length === 0 ? (
+        <EmptyHint>None.</EmptyHint>
+      ) : (
+        <div className="space-y-1">
+          {boxes.map((b) => (
+            <GenealogyBoxRow key={b.box_id} box={b} showSource={showSource} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GenealogyBoxRow({ box, showSource }: { box: GenealogyBox; showSource: boolean }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="border border-[var(--aws-border)] rounded-md p-2 bg-white">
+      <div className="flex items-center gap-2 flex-wrap text-[12px]">
+        <span className="font-mono text-[var(--aws-link)] font-semibold">{box.box_id}</span>
+        <SfgCodeChip code={box.sfg_code} />
+        {box.lot_number ? <LotChip lot={box.lot_number} /> : null}
+        <span className="text-[var(--text-secondary)]">{Number(box.net_weight).toFixed(3)} kg</span>
+        <span className="text-[var(--text-muted)]">· {box.status}</span>
+        {showSource && box.source_job_card_id != null && (
+          <span className="text-[var(--text-muted)]">· from JC {box.source_job_card_id}</span>
+        )}
+        <button
+          type="button"
+          className="ml-auto text-[12px] text-[var(--aws-link)] hover:underline"
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? "Hide trace" : "Trace"}
+        </button>
+      </div>
+      {open && <BoxTrace boxId={box.box_id} />}
+    </div>
+  );
+}
+
+function SfgCodeChip({ code }: { code: string | null }) {
+  if (!code) return <span className="text-[var(--text-muted)]">—</span>;
+  return <span className="font-mono font-semibold text-[var(--aws-navy)]">{code}</span>;
+}
+
+function BoxTrace({ boxId }: { boxId: number }) {
+  const [chain, setChain] = useState<ChainNode[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [unavailable, setUnavailable] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await apiFetch(`/api/v1/production/sfg-boxes/${boxId}/genealogy`);
+      if (!res.ok) { setUnavailable(true); setChain(null); return; }
+      const json = (await res.json()) as { chain?: ChainNode[] } | null;
+      setChain(Array.isArray(json?.chain) ? json!.chain : []);
+      setUnavailable(false);
+    } catch {
+      setUnavailable(true);
+      setChain(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [boxId]);
+
+  useEffect(() => {
+    queueMicrotask(() => { void load(); });
+  }, [load]);
+
+  if (loading) {
+    return <div className="mt-2 pl-2 text-[12px] text-[var(--text-muted)] italic">Tracing…</div>;
+  }
+  if (unavailable || !chain || chain.length === 0) {
+    return <div className="mt-2 pl-2 text-[12px] text-[var(--text-muted)] italic">No upstream lineage yet.</div>;
+  }
+
+  return (
+    <ol className="mt-2 border-t border-[var(--surface-divider)] pt-2 space-y-1">
+      {chain.map((node, i) => (
+        <li
+          key={`${node.level}-${node.box_id ?? "x"}-${i}`}
+          className="text-[12px] flex items-center gap-2 flex-wrap"
+          // Level-based indent: each step upstream nests one notch deeper.
+          style={{ paddingLeft: `${Math.max(0, node.level) * 14}px` }}
+        >
+          <span className="text-[var(--text-muted)]">{node.level === 0 ? "•" : "↳"}</span>
+          {node.box_id != null && (
+            <span className="font-mono text-[var(--aws-link)] font-semibold">{node.box_id}</span>
+          )}
+          <SfgCodeChip code={node.sfg_code} />
+          {node.lot_number ? <LotChip lot={node.lot_number} /> : null}
+          {node.source_inventory_batch_id && (
+            <span className="font-mono text-[11px] text-[var(--text-muted)]">
+              batch {node.source_inventory_batch_id}
+            </span>
+          )}
+          {node.producer_job_card_id != null && (
+            <span className="text-[var(--text-muted)]">· JC {node.producer_job_card_id}</span>
+          )}
+        </li>
+      ))}
+    </ol>
+  );
 }
 
 // ── Read-only tabs ────────────────────────────────────────────────────────
@@ -2120,11 +2813,70 @@ function EmptyHint({ children }: { children: React.ReactNode }) {
   return <p className="text-[12px] text-[var(--text-muted)] italic">{children}</p>;
 }
 
+// Create-WIP operation checklist (Slice 2). Shown only on a Create-WIP stage
+// (stage_bucket === 'Create WIP'); hidden on inline (Sorting) and terminal
+// (Final FG / Packaging) stages. Lists the practical operation for this stage
+// and the raw process step(s) that fold into it (combine-aware via the chain),
+// for the operator to confirm. Local tick state (confirmation aid).
+function CreateWipChecklist({ detail, chain }: { detail: JobCardDetail; chain: ChainStep[] }) {
+  const [ticked, setTicked] = useState<Record<number, boolean>>({});
+
+  // Gate on the SERVER's truth first: this JC must be a genuine WIP/SFG producer
+  // (output_kind), mirroring the Boxes producer test. This avoids a false
+  // positive for the real "X (Bulk Packaging" tokens, which the client classifier
+  // reads as a transform but the backend treats as a terminal FG (output_kind='FG').
+  const isProducer = ["SFG", "WIP"].includes((detail.output_kind ?? "").toUpperCase());
+
+  const { myClass, items } = useMemo(() => {
+    const names = chain.map((c) => c.process_name);
+    const classes = classifySteps(names);
+    const idx = chain.findIndex((c) => c.job_card_id === detail.job_card_id);
+    const mc = idx >= 0 ? classes[idx] : classifyProcess(detail.process_name);
+    // Raw chain steps that fold into THIS practical operation (e.g. Roasting +
+    // Flavouring → "Roast & Flavour/Salt"); fall back to this JC's own step.
+    // Keyed by job_card_id so duplicate process_names don't collide.
+    let composed: { id: number; name: string }[] =
+      idx >= 0 && mc.practicalOperation
+        ? chain
+            .filter((c, i) => classes[i].practicalOperation === mc.practicalOperation
+                              && classes[i].stageBucket === STAGE_CREATE_WIP && !!c.process_name)
+            .map((c) => ({ id: c.job_card_id, name: c.process_name as string }))
+        : [];
+    if (composed.length === 0 && detail.process_name) {
+      composed = [{ id: detail.job_card_id, name: detail.process_name }];
+    }
+    return { myClass: mc, items: composed };
+  }, [chain, detail.job_card_id, detail.process_name]);
+
+  if (!isProducer || myClass.stageBucket !== STAGE_CREATE_WIP) return null;
+
+  return (
+    <Panel title={`Create-WIP operation: ${myClass.practicalOperation ?? "—"}`}>
+      <p className="text-[12px] text-[var(--text-secondary)] mb-2">
+        Confirm the practical operation(s) combined at this stage before recording output.
+      </p>
+      <div className="space-y-1">
+        {items.map((it) => (
+          <label key={it.id} className="flex items-center gap-2 text-[13px] text-[var(--text-primary)]">
+            <input
+              type="checkbox"
+              checked={!!ticked[it.id]}
+              onChange={(e) => setTicked((p) => ({ ...p, [it.id]: e.target.checked }))}
+            />
+            {it.name}
+          </label>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
 function OverviewTab({ detail, chain, onReload }: { detail: JobCardDetail; chain: ChainStep[]; onReload: () => void }) {
   const sec = detail.section_1_product ?? {};
   const completedSteps = chain.filter((c) => c.status === "completed" || c.status === "closed").length;
   return (
     <>
+      <CreateWipChecklist detail={detail} chain={chain} />
       <Panel title="Sales order">
         <dl className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-3">
           <KV label="SO #" value={sec.so_number || detail.primary_so_number || "—"} />
@@ -2751,8 +3503,9 @@ function AccountingTab({ detail, onReload }: { detail: JobCardDetail; onReload: 
   const articles: { bom_line_id: number | null; material_sku_name: string; item_type: string; uom: string }[] =
     useMemo(() => {
       const bom = detail.bom_lines ?? [];
+      let out: { bom_line_id: number | null; material_sku_name: string; item_type: string; uom: string }[];
       if (bom.length > 0) {
-        return bom.map((b) => ({
+        out = bom.map((b) => ({
           bom_line_id: b.bom_line_id,
           material_sku_name: b.material_sku_name,
           // W3-CRIT-1 — normalise to canonical UPPERCASE so the EGA-RM
@@ -2763,10 +3516,22 @@ function AccountingTab({ detail, onReload }: { detail: JobCardDetail; onReload: 
           item_type: (b.item_type || "RM").toUpperCase(),
           uom: b.uom || "kg",
         }));
+      } else {
+        out = [];
+        for (const r of detail.rm_indents ?? []) out.push({ bom_line_id: r.bom_line_id ?? null, material_sku_name: r.material_sku_name ?? "Unknown", item_type: "RM", uom: r.uom || "kg" });
+        for (const p of detail.pm_indents ?? []) out.push({ bom_line_id: p.bom_line_id ?? null, material_sku_name: p.material_sku_name ?? "Unknown", item_type: "PM", uom: p.uom || "kg" });
       }
-      const out: { bom_line_id: number | null; material_sku_name: string; item_type: string; uom: string }[] = [];
-      for (const r of detail.rm_indents ?? []) out.push({ bom_line_id: r.bom_line_id ?? null, material_sku_name: r.material_sku_name ?? "Unknown", item_type: "RM", uom: r.uom || "kg" });
-      for (const p of detail.pm_indents ?? []) out.push({ bom_line_id: p.bom_line_id ?? null, material_sku_name: p.material_sku_name ?? "Unknown", item_type: "PM", uom: p.uom || "kg" });
+      // Slice 4: bom_lines surface on every stage (same bom_id), so the SFG/WIP
+      // input line also rides onto the SFG-PRODUCING stage (Create-WIP), where
+      // the SFG is the OUTPUT — not a consumable input. Drop it from the
+      // consumption catalogue on producer stages (output_kind SFG/WIP) so it
+      // can't be typed, returned, or counted as input there. The consumer stage
+      // (output_kind FG / pack-of-existing-SFG) keeps it. Mirrors the isProducer
+      // test used by the Boxes/Create-WIP panels.
+      const isProducer = ["SFG", "WIP"].includes((detail.output_kind ?? "").toUpperCase());
+      if (isProducer) {
+        out = out.filter((a) => a.item_type !== "SFG" && a.item_type !== "WIP");
+      }
       return out;
     }, [detail]);
 
@@ -3722,8 +4487,15 @@ function AccountingTab({ detail, onReload }: { detail: JobCardDetail; onReload: 
       const key = a.bom_line_id != null ? `b${a.bom_line_id}` : `n${a.material_sku_name}`;
       const v = num(consumption[key]);
       if (v <= 0) continue;
-      const entry = { bom_line_id: a.bom_line_id, material_sku_name: a.material_sku_name, consumed_qty: v, uom: a.uom };
-      if (a.item_type === "PM") pmCons.push(entry); else rmCons.push(entry);
+      // Slice 4: carry the row's own input_kind so an SFG/WIP opening-input
+      // line is persisted as input_kind='SFG'/'WIP' (not 'RM'). The /outputs
+      // handler defaults the bucket kind but honours this per-entry override, so
+      // the SFG#### consumption is correctly typed + kept out of RM variance.
+      const entry = { bom_line_id: a.bom_line_id, material_sku_name: a.material_sku_name, consumed_qty: v, uom: a.uom, input_kind: a.item_type };
+      // Case-insensitive PM test, consistent with every mass-balance predicate
+      // (lines ~427/3184/3381/3947). SFG/FG fall on the non-PM (rm_consumed)
+      // canonical-input side — same bucket as RM, but now self-labelled.
+      if ((a.item_type || "").toUpperCase() === "PM") pmCons.push(entry); else rmCons.push(entry);
     }
     body.rm_consumed = rmCons;
     body.pm_consumed = pmCons;
@@ -4355,6 +5127,29 @@ function AccountingTab({ detail, onReload }: { detail: JobCardDetail; onReload: 
           <FormNumber label="FG Actual Kg"    value={fgActualKg}    onChange={onChangeFgActualKg}    disabled={inputsDisabled} />
         </div>
 
+        {/* Slice 5: SFG inventory picker — only on a consuming stage (this JC
+            doesn't produce SFG) that has an SFG#### to issue (chain input_code
+            or an SFG bom_line). Lists the WIP batches its upstream stage made. */}
+        {(() => {
+          const isProducer = ["SFG", "WIP"].includes((detail.output_kind ?? "").toUpperCase());
+          if (isProducer) return null;
+          const sfgArticle = articles.find((a) => a.item_type === "SFG" || a.item_type === "WIP");
+          const sfgCode = detail.input_code || sfgArticle?.material_sku_name || null;
+          if (!sfgCode) return null;
+          const sfgKey = sfgArticle
+            ? (sfgArticle.bom_line_id != null ? `b${sfgArticle.bom_line_id}` : `n${sfgArticle.material_sku_name}`)
+            : null;
+          return (
+            <div className="mb-4">
+              <SfgInventoryPicker
+                sfgCode={sfgCode}
+                entity={detail.entity}
+                onUse={sfgKey ? (qty) => { markSectionDirty("consumption"); setConsumption((c) => ({ ...c, [sfgKey]: String(qty) })); } : undefined}
+              />
+            </div>
+          );
+        })()}
+
         {/* Material Consumption — one row per BOM article */}
         <SubsectionLabel>Material Consumption</SubsectionLabel>
         {articles.length === 0 ? (
@@ -4366,7 +5161,7 @@ function AccountingTab({ detail, onReload }: { detail: JobCardDetail; onReload: 
               return (
                 <div key={key} className="grid grid-cols-12 gap-2 items-center">
                   <div className="col-span-7 lg:col-span-5 text-[13px] text-[var(--text-primary)] truncate" title={a.material_sku_name}>
-                    {a.material_sku_name} <span className="text-[var(--text-muted)] text-[11px]">({a.item_type})</span>
+                    {a.material_sku_name} <span className={`text-[11px] ${a.item_type === "SFG" || a.item_type === "WIP" ? "text-[var(--text-success)] font-medium" : "text-[var(--text-muted)]"}`}>({a.item_type})</span>
                   </div>
                   <input
                     type="number" step="any" placeholder={`Qty (${a.uom})`}
@@ -4721,7 +5516,7 @@ function AccountingTab({ detail, onReload }: { detail: JobCardDetail; onReload: 
               return (
                 <div key={key} className="grid grid-cols-12 gap-2 items-center">
                   <div className="col-span-7 sm:col-span-8 text-[13px] text-[var(--text-primary)] truncate" title={a.material_sku_name}>
-                    {a.material_sku_name} <span className="text-[var(--text-muted)] text-[11px]">({a.item_type})</span>
+                    {a.material_sku_name} <span className={`text-[11px] ${a.item_type === "SFG" || a.item_type === "WIP" ? "text-[var(--text-success)] font-medium" : "text-[var(--text-muted)]"}`}>({a.item_type})</span>
                   </div>
                   <input
                     type="number" step="any" placeholder="0"

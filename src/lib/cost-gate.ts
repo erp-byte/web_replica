@@ -52,7 +52,7 @@ export const COST_FIELDS_ALLOW_ROLES: ReadonlySet<string> = new Set([
 //
 // Kept in the same logical groups as the Python file so adding a new
 // field there → here is a one-line mechanical edit. Length must match
-// the backend (39 fields at the time of writing). If you add a field
+// the backend (47 fields at the time of writing). If you add a field
 // here, add it there (and vice versa).
 
 export const COST_BEARING_FIELDS: ReadonlySet<string> = new Set([
@@ -80,6 +80,13 @@ export const COST_BEARING_FIELDS: ReadonlySet<string> = new Set([
   // line total from the per-component amounts.
   "igst_amount", "sgst_amount", "cgst_amount",
   "apmc_amount", "packing_amount", "freight_amount", "processing_amount",
+  // SFG / WIP valuation (RESERVED — Slice 1, enforced in Slice 5). Reserved up
+  // front so the gate exists before any cost value flows on the SFG/WIP surface.
+  // Mirror EXACTLY in server_replica response_filters.COST_BEARING_FIELDS.
+  "sfg_unit_cost", "wip_unit_cost",
+  "sfg_cost_per_kg", "wip_cost_per_kg",
+  "sfg_valuation", "wip_valuation",
+  "wip_stock_value", "wip_batch_value",
 ]);
 
 // ── Role extraction from the cached `me` payload ─────────────────────────

@@ -11,7 +11,14 @@
 
 import { registerOnSignOut } from "./auth";
 
-export type CachedRow = Record<string, unknown> & { job_card_id: number };
+export type CachedRow = Record<string, unknown> & {
+  job_card_id: number;
+  // Slice 3/7 seam codes — the SFG#### a step consumes / produces. Optional:
+  // the v2 list endpoint may not return them, and most rows carry no seam.
+  // Cached alongside the row so a back-navigation restores the SFG chip too.
+  input_code?: string | null;
+  output_code?: string | null;
+};
 
 export interface JcListCache {
   entity: string;

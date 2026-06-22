@@ -23,6 +23,10 @@ export type ConsumptionLineLike = {
   bom_line_id?: number | null;
   material_sku_name?: string | null;
   actual_consumed_qty?: number | string | null;
+  // Slice 4: RM | PM | SFG | WIP. Re-hydration keys by bom_line_id/name so it
+  // already round-trips SFG rows; carried on the type so callers can classify
+  // input-vs-PM consistently with the grid's mass-balance predicates.
+  input_kind?: string | null;
   // Stage 2: migration 038 tags every row with the batch it belongs to.
   // Legacy rows surface NULL until they're re-saved under a batch.
   batch_id?: number | null;

@@ -121,6 +121,7 @@ export interface SoFilterOptions {
   companies?: string[];
   customer_names?: string[];
   common_customer_names?: string[];
+  so_numbers?: string[];
   voucher_types?: string[];
   item_categories?: string[];
   sub_categories?: string[];
@@ -131,6 +132,7 @@ export interface SoFilterOptions {
   sales_groups?: string[];
   match_sources?: string[];
   statuses?: string[];
+  articles?: string[];
 }
 
 export interface SoListResponse {
@@ -158,6 +160,7 @@ export interface SoListQuery {
   voucher_type?: string;
   customer_name?: string;
   common_customer_name?: string;
+  so_number?: string;
   item_category?: string;
   sub_category?: string;
   uom?: string;
@@ -167,6 +170,9 @@ export interface SoListQuery {
   sales_group?: string;
   match_source?: string;
   line_status?: string;
+  // Article (so_line.sku_name) multi-select — comma-joined values, OR within
+  // the field, matching the planning page's "All Articles" filter.
+  article?: string;
 }
 
 export function buildListParams(q: SoListQuery): URLSearchParams {
@@ -223,23 +229,13 @@ export async function uploadSoBook(file: File): Promise<SoUploadResponse> {
   return (await res.json()) as SoUploadResponse;
 }
 
-// ── Fulfillment sync (auto-fired after upload) ───────────────────────────
-
-export interface FulfillmentSyncResponse {
-  synced?: number;
-  summary?: { synced?: number };
-}
-
-export async function syncFulfillment(): Promise<FulfillmentSyncResponse> {
-  // entity:null syncs across all entities — matches the Electron client's
-  // post-upload behaviour. Endpoint is idempotent on so_line_id.
-  const res = await apiFetch(`/api/v1/production/fulfillment-v2/sync`, {
-    method: "POST",
-    body: JSON.stringify({ entity: null }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return (await res.json()) as FulfillmentSyncResponse;
-}
+// ── Fulfillment sync ─────────────────────────────────────────────────────
+//
+// The fulfillment-v2/sync client lives in lib/fulfillment.ts as
+// `syncFulfillmentNow(entity?)`, which forwards an optional entity scope and
+// surfaces the server's error detail. SO Creation and Planning both call it;
+// the old entity-less `syncFulfillment()` here was removed to avoid two
+// divergent clients for the same endpoint.
 
 // ── Manual create / update ───────────────────────────────────────────────
 

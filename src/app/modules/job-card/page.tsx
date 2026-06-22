@@ -59,6 +59,15 @@ type JobCardRow = {
   plan_line_id?: number | null;
   step_number?: number | null;
   process_name?: string | null;
+  // Slice 3/7 seam codes. The v2 list endpoint surfaces the SFG#### codes a
+  // step consumes (`input_code`) and produces (`output_code`) so the list can
+  // show the Create-WIP code without opening the detail page. Both optional:
+  // the backend may not return them yet, and most rows have no seam. Render
+  // defensively — only show the chip when a code is actually present.
+  input_kind?: string | null;
+  output_kind?: string | null;
+  input_code?: string | null;   // SFG#### this step consumes
+  output_code?: string | null;  // SFG#### this step produces (Create-WIP)
   // Per-line batch label from the backend: `P{plan_id}-L{plan_line_id}-S{step}`.
   batch_number?: string | null;
   // Aggregated SO numbers for this JC's plan line — backend returns
@@ -1038,8 +1047,20 @@ function JobCardTableRow({ jc, onReload }: { jc: JobCardRow; onReload: () => voi
         {jc.fg_sku_name || "—"}
       </td>
       <td className="px-3 py-2 text-[var(--text-secondary)] hidden lg:table-cell">{jc.factory || "—"}</td>
-      <td className="px-3 py-2 text-[var(--text-secondary)] hidden lg:table-cell truncate max-w-[140px]" title={jc.stage ?? ""}>
-        {jc.stage || "—"}
+      <td className="px-3 py-2 text-[var(--text-secondary)] hidden lg:table-cell max-w-[180px]" title={jc.stage ?? ""}>
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className="truncate">{jc.stage || "—"}</span>
+          {/* Slice 7 — SFG#### produced by a Create-WIP step. Defensive:
+              only rendered when output_code is present (backend may omit it). */}
+          {jc.output_code ? (
+            <span
+              className="shrink-0 font-mono font-semibold text-[10px] text-[var(--aws-navy)] px-1 py-0.5 rounded-sm bg-[var(--surface-subtle)] border border-[var(--aws-border)]"
+              title={`Produces ${jc.output_code}`}
+            >
+              {jc.output_code}
+            </span>
+          ) : null}
+        </div>
       </td>
       <td className="px-3 py-2">
         <span
@@ -1191,8 +1212,22 @@ function PlanMergedCard({ group }: { group: PlanGroup }) {
                 {stepNo}
               </span>
               <div className="flex-1 min-w-0">
-                <div className="font-medium text-[var(--text-primary)] truncate" title={processLabel}>
-                  {processLabel}
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="font-medium text-[var(--text-primary)] truncate" title={processLabel}>
+                    {processLabel}
+                  </span>
+                  {/* Slice 7 — surface the SFG#### this Create-WIP step
+                      produces. Defensive: the v2 list endpoint may not return
+                      output_code yet, and non-producer steps have none — only
+                      render the chip when a code is actually present. */}
+                  {jc.output_code ? (
+                    <span
+                      className="shrink-0 font-mono font-semibold text-[9px] text-[var(--aws-navy)] px-1 py-0.5 rounded-sm bg-[var(--surface-subtle)] border border-[var(--aws-border)]"
+                      title={`Produces ${jc.output_code}`}
+                    >
+                      {jc.output_code}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="text-[10px] text-[var(--text-muted)] truncate">
                   {jc.floor || "—"} · {fmtBatch(qty)}

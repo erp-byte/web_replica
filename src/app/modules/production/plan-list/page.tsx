@@ -13,10 +13,9 @@
 //     just no UI yet — easy to add)
 //   • Plan name edit / re-revision flow
 
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BrandMark } from "@/components/BrandMark";
 import { useRouter } from "next/navigation";
-import { userStore } from "@/lib/auth";
 import { useRequireAuth, useUserInitial } from "@/lib/user";
 import { friendlyApiError } from "@/lib/apiErrors";
 import { BackLink } from "@/components/BackLink";
@@ -26,14 +25,20 @@ import {
   type PlanPagination,
   type PlanDetail,
   type PlanLineRow,
+  type PlanBomLine,
+  type PlanBomSummary,
   listPlans,
-  approvePlan,
-  cancelPlan,
   getPlan,
+  fetchPlanBom,
+  createLineJobCards,
+  replaceLineJobCards,
+  fetchLineJobCardConfig,
   fmtPlanKg,
   fmtPlanDate,
   fmtDateRange,
 } from "@/lib/plans";
+import { FACTORY_TO_WAREHOUSE, FLOORS_BY_FACTORY, type FactoryCode } from "@/lib/planBuilder";
+import { PROCESS_OPTIONS } from "@/lib/processCatalog";
 
 const PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 300;
@@ -92,10 +97,14 @@ export default function PlanListPage() {
   const [error, setError] = useState<string | null>(null);
 
   // UI state
-  const [confirm, setConfirm] = useState<ConfirmState | null>(null);
-  const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [expandedPlanId, setExpandedPlanId] = useState<number | null>(null);
+  // Create-Job-Card flow (scaffold). Opening sets the target plan; the modal
+  // lets the operator pick ONE of the plan's articles (radio). The actual
+  // job-card creation (entering process/floor at the JC) is wired in a later
+  // step — for now Continue just confirms the pick. This is the path that will
+  // replace Approve once the full flow lands.
+  const [jcPlan, setJcPlan] = useState<PlanRow | null>(null);
 
   // Debounce search; bump page back to 1 on every change so a stale page
   // beyond the new result set isn't requested.
@@ -188,46 +197,6 @@ export default function PlanListPage() {
     setReloadKey((k) => k + 1);
   }
 
-  async function doApprove(planId: number) {
-    const me = userStore.load();
-    const approvedBy = me?.full_name?.trim() || me?.phone || "user";
-    setBusy(true);
-    setToast(null);
-    try {
-      const r = await approvePlan(planId, { approved_by: approvedBy });
-      const jcCount = (r.job_cards?.lines || [])
-        .reduce((n, ln) => n + (ln.job_card_ids?.length || 0), 0);
-      const alreadyExisted = r.job_cards?.error === "job_cards_already_exist";
-      const msg = jcCount > 0
-        ? `Plan approved · ${jcCount} job card${jcCount === 1 ? "" : "s"} generated`
-        : alreadyExisted
-          ? `Plan approved · job cards already exist (${r.job_cards?.count ?? "?"})`
-          : "Plan approved";
-      setToast(msg);
-      setConfirm(null);
-      reload();
-    } catch (e) {
-      setToast(`Approve failed: ${friendlyApiError(e)}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function doCancel(planId: number, reason: string) {
-    setBusy(true);
-    setToast(null);
-    try {
-      await cancelPlan(planId, { reason: reason.trim() });
-      setToast("Plan cancelled · reserved fulfillment qty released.");
-      setConfirm(null);
-      reload();
-    } catch (e) {
-      setToast(`Cancel failed: ${friendlyApiError(e)}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   // Summary derived client-side from the current page.
   const summary = useMemo(() => {
     const counts = { draft: 0, approved: 0, executed: 0, cancelled: 0 };
@@ -247,12 +216,6 @@ export default function PlanListPage() {
   // renders but its `push` reference is stable in app-router.
   const onToggleExpand = useCallback((p: PlanRow) => {
     setExpandedPlanId((c) => (c === p.plan_id ? null : p.plan_id));
-  }, []);
-  const onConfirmApprove = useCallback((p: PlanRow) => {
-    setConfirm({ kind: "approve", plan: p });
-  }, []);
-  const onConfirmCancel = useCallback((p: PlanRow) => {
-    setConfirm({ kind: "cancel", plan: p });
   }, []);
   const onOpen = useCallback((p: PlanRow) => {
     router.push(`/modules/production/plan-list/${p.plan_id}`);
@@ -381,9 +344,8 @@ export default function PlanListPage() {
                 rows={rows}
                 expandedPlanId={expandedPlanId}
                 onToggleExpand={onToggleExpand}
-                onApprove={onConfirmApprove}
-                onCancel={onConfirmCancel}
                 onOpen={onOpen}
+                onCreateJobCard={setJcPlan}
               />
             </div>
             <Pagination pg={pagination} onPage={onPage} loading={loading} />
@@ -391,122 +353,49 @@ export default function PlanListPage() {
         )}
       </main>
 
-      {confirm ? (
-        <ConfirmDialog
-          state={confirm}
-          busy={busy}
-          onApprove={doApprove}
-          onCancel={doCancel}
-          onDismiss={() => setConfirm(null)}
+
+      {jcPlan ? (
+        <CreateJobCardModal
+          plan={jcPlan}
+          onClose={() => setJcPlan(null)}
+          onContinue={async (p) => {
+            if (p.planLineId == null) {
+              setToast("Pick an article first.");
+              return false;
+            }
+            // Same identity scheme the modal selects with (getLineId).
+            const ln = (jcPlan.lines_summary ?? []).find((l, i) => getLineId(l, i) === p.planLineId);
+            const article = ln?.fg_sku_name ?? "article";
+            const body = {
+              qty_kg: Number(p.qtyKg),
+              qty_units: p.qtyUnits.trim() !== "" ? Number(p.qtyUnits) : null,
+              wip_steps: p.wipSteps.map((s) => ({
+                process: s.process,
+                floor: s.floor,
+                sfg_output: s.sfgOutput || null,
+              })),
+              pkg_floor: p.pkgFloor,
+            };
+            setToast(null);
+            try {
+              if (p.mode === "edit") {
+                const r = await replaceLineJobCards(p.planLineId, body);
+                setToast(`Updated job cards for ${article} · ${r.count} stage${r.count === 1 ? "" : "s"} re-dispatched.`);
+              } else {
+                const r = await createLineJobCards(p.planLineId, body);
+                setToast(`Created ${r.count} job card${r.count === 1 ? "" : "s"} for ${article} · dispatched to floors.`);
+              }
+              reload();
+              return true;
+            } catch (e) {
+              setToast(`${p.mode === "edit" ? "Edit" : "Create"} job card failed: ${friendlyApiError(e)}`);
+              return false;
+            }
+          }}
         />
       ) : null}
 
       <Footer />
-    </div>
-  );
-}
-
-// ── Confirm state ─────────────────────────────────────────────────────────
-
-type ConfirmState =
-  | { kind: "approve"; plan: PlanRow }
-  | { kind: "cancel";  plan: PlanRow };
-
-function ConfirmDialog({
-  state, busy, onApprove, onCancel, onDismiss,
-}: {
-  state: ConfirmState;
-  busy: boolean;
-  onApprove: (planId: number) => void;
-  onCancel:  (planId: number, reason: string) => void;
-  onDismiss: () => void;
-}) {
-  const [reason, setReason] = useState("");
-  const planLabel = state.plan.plan_name || `Plan #${state.plan.plan_id}`;
-  return (
-    <div
-      className="fixed inset-0 z-30 bg-black/40 flex items-center justify-center p-4"
-      onClick={(e) => { if (e.target === e.currentTarget) onDismiss(); }}
-    >
-      <div className="w-full max-w-md bg-white border border-[var(--aws-border)] rounded-md shadow-[0_8px_24px_rgba(0,28,36,0.25)]">
-        <div className="px-4 py-3 border-b border-[var(--aws-border)] flex items-center justify-between">
-          <h3 className="text-[14px] font-semibold text-[var(--text-primary)]">
-            {state.kind === "approve" ? "Approve plan" : "Cancel plan"}
-          </h3>
-          <button
-            type="button"
-            onClick={onDismiss}
-            aria-label="Close"
-            className="w-7 h-7 inline-flex items-center justify-center rounded-sm text-[var(--text-muted)] hover:bg-[var(--surface-subtle)]"
-          >
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </button>
-        </div>
-        <div className="px-4 py-4">
-          <p className="text-[13px] text-[var(--text-primary)] mb-1">
-            <strong>{planLabel}</strong>
-          </p>
-          <p className="text-[12px] text-[var(--text-secondary)] mb-3">
-            {state.plan.warehouse ? `${state.plan.warehouse} · ` : ""}
-            {state.plan.line_count ?? 0} line{state.plan.line_count === 1 ? "" : "s"}
-            {state.plan.total_planned_kg ? ` · ${fmtPlanKg(state.plan.total_planned_kg)} kg` : ""}
-          </p>
-          {state.kind === "approve" ? (
-            <p className="text-[12px] text-[var(--text-secondary)]">
-              Approving locks the plan and auto-generates per-floor job cards from the BOM process route.
-              This cannot be reverted directly — to void an approved plan, cancel each generated job card.
-            </p>
-          ) : (
-            <>
-              <p className="text-[12px] text-[var(--text-secondary)] mb-2">
-                Cancellation releases the reserved fulfillment quantity back to pending. Only valid while the plan is in <strong>draft</strong>.
-              </p>
-              <label className="block">
-                <span className="block text-[11px] font-semibold text-[var(--text-primary)] mb-1">Reason</span>
-                <textarea
-                  value={reason}
-                  onChange={(e) => setReason(e.target.value)}
-                  rows={3}
-                  placeholder="Why is this plan being cancelled?"
-                  className="w-full px-2 py-1.5 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e] resize-none"
-                />
-              </label>
-            </>
-          )}
-        </div>
-        <div className="px-4 py-3 border-t border-[var(--aws-border)] flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onDismiss}
-            disabled={busy}
-            className="h-8 px-3 text-[12px] rounded-[2px] border border-[var(--aws-border-strong)] bg-white hover:border-[var(--aws-navy)] disabled:opacity-50"
-          >
-            Dismiss
-          </button>
-          {state.kind === "approve" ? (
-            <button
-              type="button"
-              onClick={() => onApprove(state.plan.plan_id)}
-              disabled={busy}
-              className="h-8 px-4 text-[12px] rounded-[2px] font-semibold border bg-[var(--aws-orange)] border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white disabled:opacity-50"
-            >
-              {busy ? "Approving…" : "Approve"}
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => onCancel(state.plan.plan_id, reason)}
-              disabled={busy}
-              className="h-8 px-4 text-[12px] rounded-[2px] font-semibold border border-[var(--aws-error)] bg-white text-[var(--aws-error)] hover:bg-[#fdf3f1] disabled:opacity-50"
-            >
-              {busy ? "Cancelling…" : "Cancel plan"}
-            </button>
-          )}
-        </div>
-      </div>
     </div>
   );
 }
@@ -684,18 +573,17 @@ function SummaryStrip({
 // ── Plans list (table + mobile cards) ────────────────────────────────────
 
 function PlansList({
-  rows, expandedPlanId, onToggleExpand, onApprove, onCancel, onOpen,
+  rows, expandedPlanId, onToggleExpand, onOpen, onCreateJobCard,
 }: {
   rows: PlanRow[];
   expandedPlanId: number | null;
   onToggleExpand: (p: PlanRow) => void;
-  onApprove: (p: PlanRow) => void;
-  onCancel:  (p: PlanRow) => void;
   onOpen:    (p: PlanRow) => void;
+  onCreateJobCard: (p: PlanRow) => void;
 }) {
   // The handlers are passed through verbatim — the row components apply
   // the per-row binding internally.  Wrapping callbacks here with an
-  // inline `() => onApprove(r)` would mint a new function identity per
+  // inline `() => onOpen(r)` would mint a new function identity per
   // row per render and defeat React.memo on the rows.
   return (
     <>
@@ -707,9 +595,8 @@ function PlansList({
             row={r}
             expanded={expandedPlanId === r.plan_id}
             onToggleExpand={onToggleExpand}
-            onApprove={onApprove}
-            onCancel={onCancel}
             onOpen={onOpen}
+            onCreateJobCard={onCreateJobCard}
           />
         ))}
       </div>
@@ -738,9 +625,8 @@ function PlansList({
                   row={r}
                   expanded={expandedPlanId === r.plan_id}
                   onToggleExpand={onToggleExpand}
-                  onApprove={onApprove}
-                  onCancel={onCancel}
                   onOpen={onOpen}
+                  onCreateJobCard={onCreateJobCard}
                 />
               ))}
             </tbody>
@@ -822,22 +708,21 @@ function Th({ children, right }: { children?: React.ReactNode; right?: boolean }
 // given row's data changed.  Parent-supplied callbacks are stabilised
 // with useCallback so this memo isn't busted by new function identities.
 const PlanRowDesktop = memo(function PlanRowDesktop({
-  row, expanded, onToggleExpand, onApprove, onCancel, onOpen,
+  row, expanded, onToggleExpand, onOpen, onCreateJobCard,
 }: {
   row: PlanRow;
   expanded: boolean;
   onToggleExpand: (p: PlanRow) => void;
-  onApprove: (p: PlanRow) => void;
-  onCancel: (p: PlanRow) => void;
   onOpen: (p: PlanRow) => void;
+  onCreateJobCard: (p: PlanRow) => void;
 }) {
-  const isDraft = (row.status ?? "").toLowerCase() === "draft";
+  // Any article already carded ⇒ the row's action is "Edit Job Card".
+  const hasJobCards = (row.lines_summary ?? []).some((l) => (l.job_card_count ?? 0) > 0);
   // Memoise the row-bound adapters so the per-row buttons / rowclick
   // don't churn their own listeners on every render either.
   const handleToggle = useCallback(() => onToggleExpand(row), [onToggleExpand, row]);
-  const handleApprove = useCallback(() => onApprove(row), [onApprove, row]);
-  const handleCancel = useCallback(() => onCancel(row), [onCancel, row]);
   const handleOpen = useCallback(() => onOpen(row), [onOpen, row]);
+  const handleCreateJobCard = useCallback(() => onCreateJobCard(row), [onCreateJobCard, row]);
   return (
     <>
     <tr
@@ -901,10 +786,9 @@ const PlanRowDesktop = memo(function PlanRowDesktop({
       </td>
       <td className="px-2.5 py-1.5 text-right">
         <RowActions
-          isDraft={isDraft}
-          onApprove={handleApprove}
-          onCancel={handleCancel}
+          hasJobCards={hasJobCards}
           onOpen={handleOpen}
+          onCreateJobCard={handleCreateJobCard}
         />
       </td>
     </tr>
@@ -920,20 +804,18 @@ const PlanRowDesktop = memo(function PlanRowDesktop({
 });
 
 const PlanMobileCard = memo(function PlanMobileCard({
-  row, expanded, onToggleExpand, onApprove, onCancel, onOpen,
+  row, expanded, onToggleExpand, onOpen, onCreateJobCard,
 }: {
   row: PlanRow;
   expanded: boolean;
   onToggleExpand: (p: PlanRow) => void;
-  onApprove: (p: PlanRow) => void;
-  onCancel: (p: PlanRow) => void;
   onOpen: (p: PlanRow) => void;
+  onCreateJobCard: (p: PlanRow) => void;
 }) {
-  const isDraft = (row.status ?? "").toLowerCase() === "draft";
+  const hasJobCards = (row.lines_summary ?? []).some((l) => (l.job_card_count ?? 0) > 0);
   const handleToggle = useCallback(() => onToggleExpand(row), [onToggleExpand, row]);
-  const handleApprove = useCallback(() => onApprove(row), [onApprove, row]);
-  const handleCancel = useCallback(() => onCancel(row), [onCancel, row]);
   const handleOpen = useCallback(() => onOpen(row), [onOpen, row]);
+  const handleCreateJobCard = useCallback(() => onCreateJobCard(row), [onCreateJobCard, row]);
   return (
     <div
       className="bg-white border border-[var(--aws-border)] rounded-md overflow-hidden cursor-pointer hover:border-[var(--aws-navy)]"
@@ -983,10 +865,9 @@ const PlanMobileCard = memo(function PlanMobileCard({
         />
         <div className="flex items-center gap-2 mt-2">
           <RowActions
-            isDraft={isDraft}
-            onApprove={handleApprove}
-            onCancel={handleCancel}
+            hasJobCards={hasJobCards}
             onOpen={handleOpen}
+            onCreateJobCard={handleCreateJobCard}
           />
         </div>
       </div>
@@ -1000,33 +881,35 @@ const PlanMobileCard = memo(function PlanMobileCard({
 });
 
 function RowActions({
-  isDraft, onApprove, onCancel, onOpen,
+  hasJobCards, onOpen, onCreateJobCard,
 }: {
-  isDraft: boolean;
-  onApprove: () => void;
-  onCancel: () => void;
+  hasJobCards: boolean;
   onOpen: () => void;
+  onCreateJobCard: () => void;
 }) {
   return (
     <div className="inline-flex items-center gap-1.5">
-      {isDraft ? (
-        <>
-          <button
-            type="button"
-            onClick={(e) => { e.stopPropagation(); onApprove(); }}
-            className="h-7 px-2.5 text-[11px] rounded-[2px] font-semibold border bg-[var(--aws-orange)] border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white"
-          >
-            Approve
-          </button>
-          <button
-            type="button"
-            onClick={(e) => { e.stopPropagation(); onCancel(); }}
-            className="h-7 px-2.5 text-[11px] rounded-[2px] border border-[var(--aws-border)] bg-white text-[var(--aws-error)] hover:border-[var(--aws-error)]"
-          >
-            Cancel
-          </button>
-        </>
-      ) : null}
+      {/* Create / Edit Job Card — the per-article job-card flow (replaces the
+          old Approve auto-generate). Label flips to "Edit" once this plan has
+          any job cards. */}
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); onCreateJobCard(); }}
+        title={hasJobCards ? "Edit this plan's job cards" : "Create a job card from one of this plan's articles"}
+        className="h-7 px-2.5 text-[11px] rounded-[2px] font-semibold border bg-[var(--aws-orange)] border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white inline-flex items-center gap-1"
+      >
+        {hasJobCards ? (
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+            <path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+            <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+        )}
+        {hasJobCards ? "Edit Job Card" : "Create Job Card"}
+      </button>
       <button
         type="button"
         onClick={(e) => { e.stopPropagation(); onOpen(); }}
@@ -1039,6 +922,784 @@ function RowActions({
           <polyline points="12 5 19 12 12 19" />
         </svg>
       </button>
+    </div>
+  );
+}
+
+// ── Create Job Card modal (scaffold) ───────────────────────────────────
+//
+// Opened by the per-plan "Create Job Card" button. Lists the plan's articles
+// (lines_summary) as a single-select radio checklist. Picking one + Continue
+// is where the new per-article job-card flow begins — the downstream steps
+// (entering process / floor at the job card) are wired in a follow-up. This is
+// the path that will replace Approve once complete.
+
+// Canonical line identity for the Create-Job-Card flow. A plan line SHOULD
+// carry a plan_line_id, but the summary type allows null/undefined; when it's
+// missing we fall back to the row's array index. Every site (initial radio
+// selection, the selectedLine lookup, the radio key, AND the parent's
+// onContinue lookup) MUST use this same scheme — mixing `?? 0` / `?? i` /
+// `?? null` resolves the wrong (or no) line when plan_line_id is absent.
+function getLineId(line: PlanRowLineSummary, index: number): number {
+  return line.plan_line_id ?? index;
+}
+
+function CreateJobCardModal({
+  plan, onClose, onContinue,
+}: {
+  plan: PlanRow;
+  onClose: () => void;
+  onContinue: (payload: {
+    planLineId: number | null;
+    qtyKg: string;
+    qtyUnits: string;
+    wipSteps: WipStep[];
+    pkgFloor: string;
+    mode: "create" | "edit";
+  }) => Promise<boolean>;
+}) {
+  const lines = plan.lines_summary ?? [];
+  const [step, setStep] = useState<1 | 2>(1);
+  const [selected, setSelected] = useState<number | null>(
+    lines.length === 1 ? getLineId(lines[0], 0) : null,
+  );
+  const [qtyKg, setQtyKg] = useState("");
+  const [qtyUnits, setQtyUnits] = useState("");
+  // WIP is one or more processes, each with its own floor + SFG output.
+  const [wipSteps, setWipSteps] = useState<WipStep[]>(
+    [{ process: "", floor: "", sfgOutput: "" }],
+  );
+  const [pkgFloor, setPkgFloor] = useState("");
+
+  // BOM of the selected article — drives the read-only per-step RM/PM view.
+  const [bom, setBom] = useState<PlanBomSummary | null>(null);
+  const [bomLoading, setBomLoading] = useState(false);
+  const [bomErr, setBomErr] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  // Edit mode: the chosen article already has job cards, so step 2 is prefilled
+  // from the existing chain and saving REPLACES it. `editable` is false once a
+  // stage has started (then save is blocked). `loadingCfg` covers the prefill
+  // fetch behind the Next button.
+  const [mode, setMode] = useState<"create" | "edit">("create");
+  const [editable, setEditable] = useState(true);
+  const [loadingCfg, setLoadingCfg] = useState(false);
+
+  const selectedLine = lines.find((l, i) => getLineId(l, i) === selected) ?? null;
+  const selectedBomId = selectedLine?.bom_id ?? null;
+  const selectedCarded = (selectedLine?.job_card_count ?? 0) > 0;
+
+  // Load the full BOM (no 30-line cap) whenever the chosen article changes.
+  // Async-IIFE + AbortController is this file's accepted fetch-in-effect shape
+  // (avoids the no-sync-setState-in-effect lint). RM SOs / lines without a
+  // bom_id resolve to no BOM, so the per-step panel hides itself.
+  useEffect(() => {
+    const c = new AbortController();
+    void (async () => {
+      // All setState lives inside the async IIFE — this file's accepted shape
+      // for the no-sync-setState-in-effect rule (incl. the no-BOM reset).
+      if (selectedBomId == null) {
+        setBom(null);
+        setBomErr(null);
+        setBomLoading(false);
+        return;
+      }
+      setBomLoading(true);
+      setBomErr(null);
+      try {
+        const r = await fetchPlanBom(selectedBomId, { full: true, signal: c.signal });
+        if (!c.signal.aborted) setBom(r);
+      } catch (e) {
+        if (!c.signal.aborted) {
+          setBom(null);
+          setBomErr(e instanceof Error ? e.message : "Failed to load BOM");
+        }
+      } finally {
+        if (!c.signal.aborted) setBomLoading(false);
+      }
+    })();
+    return () => c.abort();
+  }, [selectedBomId]);
+
+  // Floors come from the plan's factory: warehouse → factory code → floor set.
+  const factory = (Object.keys(FACTORY_TO_WAREHOUSE) as FactoryCode[])
+    .find((c) => FACTORY_TO_WAREHOUSE[c] === plan.warehouse);
+  const floors = factory ? [...FLOORS_BY_FACTORY[factory]] : [];
+
+  async function goNext() {
+    if (selected == null) return;
+    if (selectedCarded && selectedLine?.plan_line_id != null) {
+      // Editing an already-carded article — prefill step 2 from its chain.
+      setLoadingCfg(true);
+      try {
+        const cfg = await fetchLineJobCardConfig(selectedLine.plan_line_id);
+        if (cfg.exists) {
+          setMode("edit");
+          setEditable(cfg.editable !== false);
+          setQtyKg(cfg.qty_kg != null ? String(cfg.qty_kg) : "");
+          setQtyUnits(cfg.qty_units != null ? String(cfg.qty_units) : "");
+          setWipSteps(
+            cfg.wip_steps && cfg.wip_steps.length
+              ? cfg.wip_steps.map((s) => ({ process: s.process ?? "", floor: s.floor ?? "", sfgOutput: s.sfg_output ?? "" }))
+              : [{ process: "", floor: "", sfgOutput: "" }],
+          );
+          setPkgFloor(cfg.pkg_floor ?? "");
+        } else {
+          setMode("create");
+        }
+      } catch {
+        setMode("create");   // fall back to a create attempt; the server still guards
+      } finally {
+        setLoadingCfg(false);
+      }
+    } else {
+      setMode("create");
+      // Prefill qty + units from the chosen line the first time we advance.
+      if (qtyKg === "" && selectedLine?.planned_qty_kg != null) {
+        setQtyKg(String(selectedLine.planned_qty_kg));
+      }
+      if (qtyUnits === "" && selectedLine?.planned_qty_units != null && selectedLine.planned_qty_units !== "") {
+        setQtyUnits(String(selectedLine.planned_qty_units));
+      }
+    }
+    setStep(2);
+  }
+
+  function addWipProcess() {
+    setWipSteps((s) => [...s, { process: "", floor: "", sfgOutput: "" }]);
+  }
+
+  // Every WIP process needs both a process and a floor; plus a packaging floor.
+  const wipOk = wipSteps.length > 0 && wipSteps.every((s) => s.process !== "" && s.floor !== "");
+  const canCreate =
+    qtyKg.trim() !== "" && Number(qtyKg) > 0 && wipOk && pkgFloor !== "";
+  // In edit mode a started chain can't be replaced, so saving is blocked.
+  const canSubmit = canCreate && (mode === "create" || editable);
+
+  // Soft over-qty hint. Producing more than the line's planned kg can be
+  // legitimate (catch-up / rework), so we don't block — but an accidental
+  // extra digit is easy to miss, so we flag it. Hard reconciliation against
+  // the live pending qty is enforced server-side when the create endpoint is
+  // wired (see the Create-Job-Card backend design).
+  const plannedKg = selectedLine?.planned_qty_kg != null ? Number(selectedLine.planned_qty_kg) : null;
+  const overQty = plannedKg != null && plannedKg > 0 && Number(qtyKg) > plannedKg;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Create job card"
+    >
+      <div
+        className="bg-white rounded-md shadow-[0_8px_28px_rgba(0,28,36,0.28)] w-full max-w-[460px] max-h-[80vh] flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-4 py-3 border-b border-[var(--aws-border)] flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <h2 className="text-[14px] font-semibold text-[var(--text-primary)]">
+              {mode === "edit" ? "Edit Job Card" : "Create Job Card"}
+            </h2>
+            <p className="text-[11px] text-[var(--text-secondary)] mt-0.5 truncate">
+              {plan.plan_name || `Plan #${plan.plan_id}`} · {step === 1 ? "pick an article" : "quantity & steps"}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="shrink-0 w-7 h-7 inline-flex items-center justify-center rounded-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--surface-subtle)]"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+
+        {step === 1 ? (
+          <div className="overflow-y-auto p-2">
+            {lines.length === 0 ? (
+              <p className="text-[12px] text-[var(--text-muted)] italic p-3">This plan has no articles.</p>
+            ) : (
+              <ul className="space-y-1">
+                {lines.map((l, i) => {
+                  const id = getLineId(l, i);
+                  const kg = l.planned_qty_kg != null ? fmtPlanKg(l.planned_qty_kg) : null;
+                  const pcs = l.planned_qty_units != null && l.planned_qty_units !== ""
+                    ? String(l.planned_qty_units) : null;
+                  const checked = selected === id;
+                  const carded = (l.job_card_count ?? 0) > 0;
+                  return (
+                    <li key={id}>
+                      <label
+                        className={[
+                          "flex items-center gap-2.5 px-3 py-2 rounded-sm border cursor-pointer transition-colors",
+                          checked
+                            ? "border-[var(--aws-orange)] bg-[#fef6e7]"
+                            : "border-[var(--aws-border)] hover:border-[var(--aws-navy)]",
+                        ].join(" ")}
+                      >
+                        <input
+                          type="radio"
+                          name="jc-article"
+                          checked={checked}
+                          onChange={() => {
+                            // Switching article drops the previous article's qty
+                            // and edit state so goNext re-resolves from the newly
+                            // picked line (create-prefill or edit-prefill).
+                            if (selected !== id) {
+                              setSelected(id);
+                              setQtyKg("");
+                              setQtyUnits("");
+                              setMode("create");
+                              setEditable(true);
+                            }
+                          }}
+                          className="accent-[var(--aws-orange)]"
+                        />
+                        <span className="flex-1 min-w-0">
+                          <span className="flex items-center gap-1.5 min-w-0">
+                            <span className="text-[13px] text-[var(--text-primary)] truncate" title={l.fg_sku_name ?? ""}>
+                              {l.fg_sku_name || "—"}
+                            </span>
+                            {carded ? (
+                              <span className="shrink-0 px-1 py-0.5 text-[9px] font-bold uppercase rounded-[2px] border bg-[#eef7ee] text-[#2e7d32] border-[#bfe0c0]">
+                                Carded
+                              </span>
+                            ) : null}
+                          </span>
+                          {(kg != null || pcs != null) ? (
+                            <span className="block text-[11px] font-mono text-[var(--text-muted)]">
+                              {kg != null ? `${kg} kg` : ""}{kg != null && pcs != null ? " · " : ""}{pcs != null ? `${pcs} pcs` : ""}
+                            </span>
+                          ) : null}
+                        </span>
+                      </label>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        ) : (
+          <div className="overflow-y-auto p-4 space-y-4">
+            <div className="text-[12px]">
+              <span className="text-[var(--text-muted)]">Article: </span>
+              <span className="font-semibold text-[var(--text-primary)]">{selectedLine?.fg_sku_name ?? "—"}</span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block">
+                <span className="block text-[11px] font-semibold text-[var(--text-primary)] mb-1">
+                  Quantity (kg) <span className="text-[var(--aws-error)]">*</span>
+                </span>
+                <input
+                  type="number"
+                  step="any"
+                  min="0"
+                  value={qtyKg}
+                  onChange={(e) => setQtyKg(e.target.value)}
+                  placeholder="0"
+                  className="w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+                />
+              </label>
+              <label className="block">
+                <span className="block text-[11px] font-semibold text-[var(--text-primary)] mb-1">Units (nos)</span>
+                <input
+                  type="number"
+                  step="any"
+                  min="0"
+                  value={qtyUnits}
+                  onChange={(e) => setQtyUnits(e.target.value)}
+                  placeholder="0"
+                  className="w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+                />
+              </label>
+            </div>
+
+            {overQty ? (
+              <p className="text-[11px] text-[#9a393e] -mt-2">
+                Quantity exceeds this article&apos;s planned {fmtPlanKg(plannedKg!)} kg — double-check before creating.
+              </p>
+            ) : null}
+
+            <div className="space-y-3">
+              {/* WIP — one or more processes, each on its own floor */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-[11px] uppercase tracking-wide font-semibold text-[var(--text-secondary)]">
+                    WIP <span className="text-[var(--aws-error)]">*</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={addWipProcess}
+                    className="h-6 px-2 text-[11px] rounded-[2px] border border-[var(--aws-border-strong)] bg-white hover:border-[var(--aws-navy)] inline-flex items-center gap-1"
+                  >
+                    <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+                      <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                    Add process
+                  </button>
+                </div>
+                <WipProcessList steps={wipSteps} floors={floors} onChange={setWipSteps} />
+              </div>
+
+              {/* Packaging — single floor */}
+              <StepFloorRow label="Packaging" floors={floors} value={pkgFloor} onChange={setPkgFloor} />
+
+              {floors.length === 0 ? (
+                <p className="text-[10px] text-[var(--text-muted)] italic">
+                  No floor list for this warehouse — enter the floor name.
+                </p>
+              ) : null}
+            </div>
+
+            {mode === "edit" && !editable ? (
+              <p className="px-2 py-1.5 text-[11px] rounded border text-[#9a393e] border-[var(--aws-border)] bg-[#fdf0f1]">
+                These job cards have already started — they can&apos;t be edited.
+              </p>
+            ) : null}
+
+            {/* BOM per process step (read-only). RM+PM under the first WIP
+                step, SFG opening-input under packaging — the operational
+                model of how job cards actually issue material. */}
+            <MaterialsByStep
+              wipSteps={wipSteps}
+              pkgFloor={pkgFloor}
+              bom={bom}
+              loading={bomLoading}
+              err={bomErr}
+              hasBom={selectedBomId != null}
+            />
+          </div>
+        )}
+
+        <div className="px-4 py-3 border-t border-[var(--aws-border)] flex items-center justify-between gap-2">
+          {step === 1 ? (
+            <>
+              <span className="text-[11px] text-[var(--text-muted)] italic">Pick the article to make a job card for.</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="h-8 px-3 text-[12px] rounded-[2px] border border-[var(--aws-border-strong)] bg-white hover:border-[var(--aws-navy)]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={selected == null || loadingCfg}
+                  onClick={goNext}
+                  className="h-8 px-4 text-[12px] rounded-[2px] font-semibold border bg-[var(--aws-orange)] border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {loadingCfg ? "Loading…" : "Next"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => setStep(1)}
+                className="h-8 px-3 text-[12px] rounded-[2px] border border-[var(--aws-border-strong)] bg-white hover:border-[var(--aws-navy)]"
+              >
+                Back
+              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="h-8 px-3 text-[12px] rounded-[2px] border border-[var(--aws-border-strong)] bg-white hover:border-[var(--aws-navy)]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={!canSubmit || creating}
+                  onClick={async () => {
+                    setCreating(true);
+                    const ok = await onContinue({ planLineId: selected, qtyKg, qtyUnits, wipSteps, pkgFloor, mode });
+                    if (ok) onClose();        // success → modal unmounts
+                    else setCreating(false);  // failure → stay open (toast shows why)
+                  }}
+                  className="h-8 px-4 text-[12px] rounded-[2px] font-semibold border bg-[var(--aws-orange)] border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {creating
+                    ? (mode === "edit" ? "Saving…" : "Creating…")
+                    : (mode === "edit" ? "Save changes" : "Create Job Card")}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// WIP process list — mirrors the planning page's StepsSection logic
+// (drag + ↑/↓ reorder, multi-select merge, remove) adapted to the WIP
+// { process, floor } shape. Merge joins process names with " + " and keeps a
+// floor only when the selected rows agree (conflict → blank, operator re-picks),
+// matching planning's mergeCardSteps. State (drag + merge-selection) is local;
+// committed changes flow up through onChange.
+type WipStep = { process: string; floor: string; sfgOutput: string };
+
+function WipProcessList({
+  steps, floors, onChange,
+}: {
+  steps: WipStep[];
+  floors: string[];
+  onChange: (next: WipStep[]) => void;
+}) {
+  const dragFromRef = useRef<number | null>(null);
+  const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
+  const [selectedIdxs, setSelectedIdxs] = useState<Set<number>>(new Set());
+
+  // Merge is one-shot — once the list length changes the indices no longer
+  // line up, so clear the selection. Deferred past the effect body to satisfy
+  // the no-sync-setState-in-effect rule (same pattern as planning).
+  useEffect(() => {
+    queueMicrotask(() => setSelectedIdxs(new Set()));
+  }, [steps.length]);
+
+  const allSelected = steps.length > 0 && selectedIdxs.size === steps.length;
+  const anySelected = selectedIdxs.size > 0;
+
+  function move(from: number, to: number) {
+    if (from < 0 || from >= steps.length || to < 0 || to >= steps.length || from === to) return;
+    const next = steps.slice();
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    onChange(next);
+  }
+  function setField(i: number, patch: Partial<WipStep>) {
+    onChange(steps.map((x, j) => (j === i ? { ...x, ...patch } : x)));
+  }
+  function remove(i: number) {
+    if (steps.length <= 1) return;
+    onChange(steps.filter((_, j) => j !== i));
+  }
+  function toggleSelect(i: number) {
+    setSelectedIdxs((prev) => {
+      const n = new Set(prev);
+      if (n.has(i)) n.delete(i); else n.add(i);
+      return n;
+    });
+  }
+  function selectAll(on: boolean) {
+    setSelectedIdxs(on ? new Set(steps.map((_, i) => i)) : new Set());
+  }
+  function merge() {
+    const valid = [...selectedIdxs].filter((i) => i >= 0 && i < steps.length).sort((a, b) => a - b);
+    if (valid.length < 2) return;
+    const picked = valid.map((i) => steps[i]);
+    const process = picked.map((p) => p.process || "—").join(" + ");
+    const uniqueFloors = new Set(picked.map((p) => p.floor).filter(Boolean));
+    const floor = uniqueFloors.size === 1 ? [...uniqueFloors][0] : "";
+    // Preserve every distinct SFG output rather than silently keeping only the
+    // first — output identity is load-bearing for the SFG seam, so dropping the
+    // rest would lose the codes the operator entered. Distinct, in order; the
+    // operator can prune the joined value if the merge was a mistake.
+    const sfgOutput = [...new Set(picked.map((p) => p.sfgOutput).filter(Boolean))].join(" + ");
+    const [firstIdx, ...rest] = valid;
+    const next = steps.slice();
+    // Remove the trailing merged rows right-to-left so earlier indices stay put,
+    // then write the merged step into the first selected slot.
+    [...rest].reverse().forEach((i) => next.splice(i, 1));
+    next[firstIdx] = { process, floor, sfgOutput };
+    setSelectedIdxs(new Set());
+    onChange(next);
+  }
+
+  const iconBtn = "w-6 h-7 inline-flex items-center justify-center rounded-sm text-[var(--text-secondary)] hover:bg-[var(--surface-subtle)] disabled:opacity-30 disabled:cursor-not-allowed";
+
+  return (
+    <div>
+      {/* Process checklist toolbar — a checkbox per process (below) plus
+          Select-all + Merge here. Always shown; Merge stays disabled until 2+
+          processes are checked. Mirrors the planning page's StepsSection. */}
+      <div className="flex flex-wrap items-center gap-2 mb-1.5 px-2 py-1.5 bg-[var(--surface-subtle)] border border-[var(--aws-border)] rounded">
+          <label className="inline-flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] cursor-pointer">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              ref={(el) => { if (el) el.indeterminate = anySelected && !allSelected; }}
+              onChange={(e) => selectAll(e.target.checked)}
+              className="accent-[var(--aws-orange)]"
+            />
+            <span>Select all</span>
+          </label>
+          <span className="text-[11px] text-[var(--text-muted)]">·</span>
+          <span className="text-[11px] text-[var(--text-secondary)]">
+            <strong className="text-[var(--text-primary)]">{selectedIdxs.size}</strong> selected
+          </span>
+          <div className="flex-1" />
+          <button
+            type="button"
+            disabled={selectedIdxs.size < 2}
+            onClick={merge}
+            title="Combine the selected processes into one (names joined with +)"
+            className={[
+              "h-7 px-2.5 text-[11px] rounded-[2px] font-semibold border inline-flex items-center gap-1.5",
+              selectedIdxs.size < 2
+                ? "bg-[var(--surface-disabled)] border-[var(--aws-border)] text-[var(--text-disabled)] cursor-not-allowed"
+                : "bg-[var(--aws-orange)] border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white",
+            ].join(" ")}
+          >
+            <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="8 12 3 12 8 7" /><polyline points="16 12 21 12 16 17" /><line x1="3" y1="12" x2="21" y2="12" />
+            </svg>
+            Merge processes
+          </button>
+      </div>
+
+      <ol className="space-y-1.5">
+        {steps.map((s, i) => {
+          const isDragOver = dragOverIdx === i;
+          return (
+            <li
+              key={`${s.process}-${i}`}
+              draggable
+              onDragStart={(e) => { dragFromRef.current = i; e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", String(i)); }}
+              onDragEnd={() => { dragFromRef.current = null; setDragOverIdx(null); }}
+              onDragOver={(e) => { if (dragFromRef.current == null) return; e.preventDefault(); setDragOverIdx(i); }}
+              onDragLeave={() => setDragOverIdx((c) => (c === i ? null : c))}
+              onDrop={(e) => { e.preventDefault(); const from = dragFromRef.current; if (from == null || from === i) return; move(from, i); dragFromRef.current = null; setDragOverIdx(null); }}
+              className={[
+                "border rounded bg-white px-2 py-1.5",
+                isDragOver ? "border-[var(--aws-orange)] bg-[#fdf0f1]" : "border-[var(--aws-border)]",
+              ].join(" ")}
+            >
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={selectedIdxs.has(i)}
+                  onChange={() => toggleSelect(i)}
+                  title="Select to merge"
+                  className="accent-[var(--aws-orange)] shrink-0"
+                />
+                <span aria-hidden title="Drag to reorder" className="shrink-0 inline-flex items-center justify-center w-4 h-7 text-[var(--text-muted)] cursor-grab active:cursor-grabbing">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                    <circle cx="9" cy="6" r="1.4" /><circle cx="15" cy="6" r="1.4" /><circle cx="9" cy="12" r="1.4" /><circle cx="15" cy="12" r="1.4" /><circle cx="9" cy="18" r="1.4" /><circle cx="15" cy="18" r="1.4" />
+                  </svg>
+                </span>
+                <span className="shrink-0 inline-flex items-center justify-center w-5 h-5 rounded-full bg-[var(--aws-navy)] text-white text-[10px] font-bold">{i + 1}</span>
+                {/* Process + floor stacked in one aligned column; the process
+                    name truncates with … and shows full on hover (title). */}
+                <div className="flex-1 min-w-0 space-y-1">
+                  <select
+                    value={s.process}
+                    onChange={(e) => setField(i, { process: e.target.value })}
+                    title={s.process || undefined}
+                    className="w-full truncate h-7 px-1.5 text-[12px] font-semibold rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+                  >
+                    <option value="">— Process —</option>
+                    {PROCESS_OPTIONS.map((p) => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                  {floors.length > 0 ? (
+                    <select
+                      value={s.floor}
+                      onChange={(e) => setField(i, { floor: e.target.value })}
+                      title={s.floor || undefined}
+                      className="w-full truncate h-7 px-1.5 text-[12px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+                    >
+                      <option value="">— Floor —</option>
+                      {floors.map((f) => <option key={f} value={f}>{f}</option>)}
+                    </select>
+                  ) : (
+                    <input
+                      value={s.floor}
+                      onChange={(e) => setField(i, { floor: e.target.value })}
+                      placeholder="Floor"
+                      className="w-full h-7 px-1.5 text-[12px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+                    />
+                  )}
+                  <input
+                    value={s.sfgOutput}
+                    onChange={(e) => setField(i, { sfgOutput: e.target.value })}
+                    title={s.sfgOutput || undefined}
+                    placeholder="SFG output (e.g. SFG0042)"
+                    className="w-full truncate h-7 px-1.5 text-[12px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+                  />
+                </div>
+                <div className="flex items-center gap-0.5 shrink-0">
+                  <button type="button" onClick={() => move(i, i - 1)} disabled={i === 0} aria-label="Move up" className={iconBtn}>
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><polyline points="6 15 12 9 18 15" /></svg>
+                  </button>
+                  <button type="button" onClick={() => move(i, i + 1)} disabled={i === steps.length - 1} aria-label="Move down" className={iconBtn}>
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
+                  </button>
+                  <button type="button" onClick={() => remove(i)} disabled={steps.length <= 1} aria-label="Remove process" className={[iconBtn, "hover:text-[var(--aws-error)]"].join(" ")}>
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                  </button>
+                </div>
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
+// Required floor field for a job-card step (WIP / Packaging). A select when the
+// plan's warehouse has a known floor set, else a free-text input.
+function StepFloorRow({
+  label, floors, value, onChange,
+}: {
+  label: string; floors: string[]; value: string; onChange: (v: string) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-[88px] shrink-0 text-[12px] font-medium text-[var(--text-primary)]">
+        {label} <span className="text-[var(--aws-error)]">*</span>
+      </span>
+      {floors.length > 0 ? (
+        <select
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="flex-1 h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+        >
+          <option value="">— Pick floor —</option>
+          {floors.map((f) => <option key={f} value={f}>{f}</option>)}
+        </select>
+      ) : (
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="Floor"
+          className="flex-1 h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+        />
+      )}
+    </div>
+  );
+}
+
+// Read-only "Materials per step" — maps the BOM's RM / PM / SFG lines onto the
+// job card's process steps using the OPERATIONAL model (how job cards actually
+// issue material, per job_card_v2._materialise_indents): ALL RM + PM are issued
+// on the FIRST WIP step; intermediate WIP steps consume upstream WIP and issue
+// nothing fresh; any SFG opening-input is consumed at the packaging (Final FG)
+// step. Reflects the live wipSteps order, so reordering updates which step is
+// "first". Renders nothing for articles without a BOM (e.g. RM SOs).
+function MaterialsByStep({
+  wipSteps, pkgFloor, bom, loading, err, hasBom,
+}: {
+  wipSteps: WipStep[];
+  pkgFloor: string;
+  bom: PlanBomSummary | null;
+  loading: boolean;
+  err: string | null;
+  hasBom: boolean;
+}) {
+  if (!hasBom) return null;
+
+  const kind = (t: string | null | undefined) => (t ?? "").trim().toLowerCase();
+  const allLines = bom?.lines ?? [];
+  const rm = allLines.filter((l) => kind(l.item_type) === "rm");
+  const pm = allLines.filter((l) => kind(l.item_type) === "pm");
+  const sfg = allLines.filter((l) => kind(l.item_type) === "sfg");
+
+  const chip = (t: string | null | undefined) => {
+    const k = kind(t);
+    const cls =
+      k === "rm" ? "bg-[#fef6e7] text-[#8a6d1a] border-[#e8d8a8]"
+      : k === "pm" ? "bg-[#eef4fb] text-[var(--aws-navy)] border-[#c9ddf2]"
+      : k === "sfg" ? "bg-[#fdeee0] text-[#9a5a14] border-[#f0c79a]"
+      : "bg-[var(--surface-subtle)] text-[var(--text-secondary)] border-[var(--aws-border)]";
+    return (
+      <span className={`shrink-0 px-1 py-0.5 text-[9px] font-bold uppercase rounded-[2px] border ${cls}`}>
+        {t || "—"}
+      </span>
+    );
+  };
+
+  // A plain render helper (NOT a nested component) so it doesn't trip the
+  // unstable-nested-component rule and never remounts the rows.
+  const renderRows = (rows: PlanBomLine[]) =>
+    rows.length === 0 ? null : (
+      <ul className="mt-1 space-y-0.5">
+        {rows.map((l, i) => (
+          <li key={`${l.bom_line_id ?? "x"}-${i}`} className="flex items-center gap-1.5 text-[11px]">
+            {chip(l.item_type)}
+            <span className="flex-1 min-w-0 truncate text-[var(--text-primary)]" title={l.material_sku_name ?? ""}>
+              {l.material_sku_name || "—"}
+            </span>
+            <span className="shrink-0 font-mono text-[var(--text-secondary)]">
+              {l.quantity_per_unit != null ? l.quantity_per_unit : "—"}{l.uom ? ` ${l.uom}` : ""}
+            </span>
+            {l.godown ? <span className="shrink-0 text-[10px] text-[var(--text-muted)]">{l.godown}</span> : null}
+          </li>
+        ))}
+      </ul>
+    );
+
+  return (
+    <div>
+      <span className="text-[11px] uppercase tracking-wide font-semibold text-[var(--text-secondary)]">
+        Materials per step
+      </span>
+      {loading ? (
+        <div className="mt-1.5 text-[11px] text-[var(--text-secondary)] flex items-center gap-2 py-1">
+          <span className="inline-block w-3 h-3 border-2 border-[var(--aws-border-strong)] border-t-[var(--aws-orange)] rounded-full animate-spin" />
+          Loading BOM…
+        </div>
+      ) : err ? (
+        <p className="mt-1.5 px-2 py-1.5 text-[11px] italic rounded border text-[var(--aws-error)] border-[var(--aws-border)] bg-[#fdf0f1]">
+          {err}
+        </p>
+      ) : allLines.length === 0 ? (
+        <p className="mt-1.5 px-2 py-1.5 text-[11px] italic rounded border border-dashed border-[var(--aws-border)] bg-[var(--surface-subtle)] text-[var(--text-muted)]">
+          No BOM materials configured for this article.
+        </p>
+      ) : (
+        <div className="mt-1.5 space-y-1.5">
+          {wipSteps.map((s, i) => (
+            <div key={`${s.process}-${i}`} className="border border-[var(--aws-border)] rounded px-2 py-1.5 bg-white">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--text-primary)]">
+                <span className="shrink-0 inline-flex items-center justify-center w-4 h-4 rounded-full bg-[var(--aws-navy)] text-white text-[9px] font-bold">{i + 1}</span>
+                <span className="truncate" title={s.process || undefined}>{s.process || `WIP step ${i + 1}`}</span>
+                {s.floor ? <span className="shrink-0 text-[10px] font-normal text-[var(--text-muted)]">· {s.floor}</span> : null}
+              </div>
+              {i === 0 ? (
+                rm.length + pm.length === 0 ? (
+                  <p className="mt-1 text-[10px] italic text-[var(--text-muted)]">No RM/PM in this BOM.</p>
+                ) : (
+                  <>
+                    {renderRows(rm)}
+                    {renderRows(pm)}
+                  </>
+                )
+              ) : (
+                <p className="mt-1 text-[10px] italic text-[var(--text-muted)]">
+                  Consumes WIP from the previous stage — no fresh material issued.
+                </p>
+              )}
+            </div>
+          ))}
+
+          {/* Packaging — the Final FG stage; consumes the SFG opening input. */}
+          <div className="border border-[var(--aws-border)] rounded px-2 py-1.5 bg-white">
+            <div className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--text-primary)]">
+              <span className="shrink-0 inline-flex items-center justify-center w-4 h-4 rounded-full bg-[var(--aws-orange)] text-white text-[9px] font-bold">P</span>
+              <span>Packaging</span>
+              {pkgFloor ? <span className="shrink-0 text-[10px] font-normal text-[var(--text-muted)]">· {pkgFloor}</span> : null}
+            </div>
+            {sfg.length > 0 ? (
+              renderRows(sfg)
+            ) : (
+              <p className="mt-1 text-[10px] italic text-[var(--text-muted)]">
+                Final FG / packing — no opening SFG in this BOM.
+              </p>
+            )}
+          </div>
+
+          <p className="text-[10px] text-[var(--text-muted)] leading-snug">
+            RM + PM are issued on the first stage (matching how job cards issue material); any SFG opening input is consumed at packaging.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

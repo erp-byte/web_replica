@@ -15,11 +15,13 @@ import { apiFetch, readApiErrorMessage } from "./auth";
 // in the UI ("+N more").
 export interface PlanRowLineSummary {
   plan_line_id?: number | null;
+  bom_id?: number | null;
   fg_sku_name?: string | null;
   customer_name?: string | null;
   planned_qty_kg?: number | string | null;
   planned_qty_units?: number | string | null;
   area?: string | null;
+  job_card_count?: number | null;   // >0 ⇒ article already carded (Edit, not Create)
 }
 
 export interface PlanRow {
@@ -159,6 +161,116 @@ export async function getPlan(
     throw new Error(await readApiErrorMessage(res, `Plan HTTP ${res.status}`));
   }
   return (await res.json()) as PlanDetail;
+}
+
+// ── BOM summary (for the Create-Job-Card wizard's per-step RM/PM view) ──────
+// Backed by GET /plans-v2/bom/{bom_id}. Pass full=true to get EVERY line —
+// the endpoint otherwise caps at 30 for the Plan-Detail hover-card.
+export interface PlanBomLine {
+  bom_line_id?: number | null;
+  line_number?: number | null;
+  material_sku_name?: string | null;
+  item_type?: string | null;        // 'rm' | 'pm' | 'sfg' | 'fg'
+  quantity_per_unit?: number | null;
+  uom?: string | null;
+  loss_pct?: number | null;
+  godown?: string | null;           // 'RM Store' | 'PM Store' | ...
+}
+
+export interface PlanBomSummary {
+  header?: Record<string, unknown> | null;
+  counts?: { rm_count?: number; pm_count?: number; total_count?: number } | null;
+  lines: PlanBomLine[];
+  steps?: Array<Record<string, unknown>> | null;
+}
+
+export async function fetchPlanBom(
+  bomId: number,
+  opts?: { full?: boolean; signal?: AbortSignal },
+): Promise<PlanBomSummary> {
+  const qs = opts?.full ? "?full=true" : "";
+  const res = await apiFetch(`/api/v1/production/plans-v2/bom/${bomId}${qs}`, { signal: opts?.signal });
+  if (res.status === 404) throw new Error("BOM not found.");
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, `BOM HTTP ${res.status}`));
+  }
+  return (await res.json()) as PlanBomSummary;
+}
+
+// ── Create Job Card (per-article wizard) ───────────────────────────────────
+// One chained job card per WIP process → a terminating Packaging card, each
+// dispatched to its floor. Backed by POST /plans-v2/lines/{id}/job-cards.
+export interface CreateJobCardStep {
+  process: string;
+  floor: string;
+  sfg_output?: string | null;
+}
+
+export interface CreateJobCardBody {
+  qty_kg: number;
+  qty_units?: number | null;
+  wip_steps: CreateJobCardStep[];
+  pkg_floor: string;
+}
+
+export interface CreateJobCardResult {
+  plan_id: number;
+  plan_line_id: number;
+  job_card_ids: number[];
+  count: number;
+}
+
+export async function createLineJobCards(
+  planLineId: number,
+  body: CreateJobCardBody,
+): Promise<CreateJobCardResult> {
+  const res = await apiFetch(
+    `/api/v1/production/plans-v2/lines/${planLineId}/job-cards`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, `Create job card HTTP ${res.status}`));
+  }
+  return (await res.json()) as CreateJobCardResult;
+}
+
+// Current job-card config for a line, shaped to prefill the Edit wizard.
+// exists=false ⇒ no cards yet (Create); editable=false ⇒ a stage already
+// started, so it can't be replaced.
+export interface LineJobCardConfig {
+  exists: boolean;
+  editable?: boolean;
+  started?: boolean;
+  qty_kg?: number | null;
+  qty_units?: number | null;
+  wip_steps?: { process?: string | null; floor?: string | null; sfg_output?: string | null }[];
+  pkg_floor?: string | null;
+}
+
+export async function fetchLineJobCardConfig(
+  planLineId: number,
+): Promise<LineJobCardConfig> {
+  const res = await apiFetch(`/api/v1/production/plans-v2/lines/${planLineId}/job-cards`);
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, `Load job card HTTP ${res.status}`));
+  }
+  return (await res.json()) as LineJobCardConfig;
+}
+
+// Edit = replace the line's job cards (delete + recreate). Refused server-side
+// (409) once any stage has started.
+export async function replaceLineJobCards(
+  planLineId: number,
+  body: CreateJobCardBody,
+): Promise<CreateJobCardResult> {
+  const res = await apiFetch(
+    `/api/v1/production/plans-v2/lines/${planLineId}/job-cards`,
+    { method: "PUT", body: JSON.stringify(body) },
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, `Edit job card HTTP ${res.status}`));
+  }
+  return (await res.json()) as CreateJobCardResult;
 }
 
 // ── Update (partial) ────────────────────────────────────────────────────

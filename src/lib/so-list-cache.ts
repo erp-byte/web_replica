@@ -23,10 +23,25 @@ export interface SoListCache {
   // Sets serialized as arrays — JSON.stringify of a Set returns "{}".
   // Page lazy-init reconstructs `new Set(arr)`.
   advFilters: Record<string, string[]>;
+  // Entity scope (so_header.company) — header segmented control; "" = All.
+  company: string;
+  // Planning-parity top-level toolbar filters — kept separate from advFilters
+  // so each persists/rehydrates as its own array.
+  customer: string[];
+  soNumber: string[];
+  article: string[];
   sortBy: "so_number" | "so_date" | "gst_status" | "customer_name" | "company";
   sortOrder: "asc" | "desc";
   page: number;
   expanded: number[];
+  // In-progress plan selection — the checked article so_line_ids and their
+  // resolved so_line_id→fulfillment_id pairs, so a refresh / back-nav keeps an
+  // unsaved plan instead of silently dropping it. Sets/Maps serialize as
+  // arrays (JSON.stringify of a Set/Map yields "{}"); the page rehydrates
+  // `new Set(arr)` / `new Map(pairs)` and re-feeds the plan-builder panel.
+  // Optional + defaulted so pre-existing cache entries stay valid.
+  selectedLineIds?: number[];
+  lineToFulfillment?: [number, number][];
 }
 
 export function loadSoListCache(): SoListCache | null {

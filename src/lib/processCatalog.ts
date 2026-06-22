@@ -15,7 +15,9 @@ export const PROCESS_OPTIONS: readonly string[] = [
   "Roasting",
   "De-seeding",  // legacy spelling "De-Seeding" maps to this via canonProcess
   "Blanching",
-  "Slicing/Dicing/Slivering",
+  "Slicing",
+  "Dicing",
+  "Slivering",
   "Chocolate",
   "Stuffing",
   "Enrobing",
@@ -65,4 +67,72 @@ export function stageFromProcess(name: string | null | undefined): string | null
   const cleaned = name.trim();
   if (!cleaned) return null;
   return cleaned.toLowerCase().replace(/ /g, "_");
+}
+
+// ── Process-category classification (Slice 2) ──────────────────────────────
+// Client mirror of master_ingest.classify_route_steps. Each Process-Category
+// token maps to a practical operation + a stage bucket. G2 LOCKED: Sorting =
+// inline; Packaging family = terminal (Final FG). Matches on the LEADING token
+// (text before "(") so "Roasting (Bulk Packaging" classifies like "Roasting".
+
+export const STAGE_CREATE_WIP = "Create WIP";
+export const STAGE_FINAL_FG = "Final FG";
+export const STAGE_INLINE = "inline";
+
+const _TRANSFORM_OPS: Record<string, string> = {
+  "de-seeding": "De-Seeding",
+  "deseeding": "De-Seeding",
+  "blanching": "Blanch & Slice",
+  "slicing/dicing/slivering": "Blanch & Slice",
+  "slicing": "Blanch & Slice",
+  "dicing": "Blanch & Slice",
+  "slivering": "Blanch & Slice",
+  "blending": "Blend & Form",
+  "bar forming": "Blend & Form",
+  "roasting": "Roasting",
+  "flavouring": "Roast & Flavour/Salt",
+  "salting": "Roast & Flavour/Salt",
+  "stuffing": "Stuffing",
+  "enrobing": "Enrobe / Choco-Coat",
+  "chocolate": "Enrobe / Choco-Coat",
+};
+const _SEASONING = new Set(["flavouring", "salting"]);
+const _TERMINAL = new Set([
+  "packaging", "bulk packaging", "master carton", "mono carton", "monocarton",
+  "flow wrap", "krugger", "x-ray", "xray", "weighing",
+]);
+const _INLINE = new Set(["sorting", "receiving"]);
+
+function _canonToken(name: string | null | undefined): string {
+  return (name ?? "").trim().toLowerCase().split("(")[0].trim();
+}
+
+export type ProcessClass = {
+  practicalOperation: string | null;
+  stageBucket: string | null;
+  producesSfg: boolean;
+};
+
+// Classify an FG's ORDERED steps (combine-aware: Roasting + a seasoning token
+// ⇒ the Roasting step becomes the combined "Roast & Flavour/Salt").
+export function classifySteps(stepNames: (string | null | undefined)[]): ProcessClass[] {
+  const canon = stepNames.map(_canonToken);
+  const hasSeason = canon.some((t) => _SEASONING.has(t));
+  return canon.map((t) => {
+    // Object.hasOwn (not `t in`) so a token like "constructor"/"__proto__" can't
+    // match an inherited prototype key — mirrors the Python dict's behaviour.
+    if (Object.hasOwn(_TRANSFORM_OPS, t)) {
+      const op = t === "roasting" && hasSeason ? "Roast & Flavour/Salt" : _TRANSFORM_OPS[t];
+      return { practicalOperation: op, stageBucket: STAGE_CREATE_WIP, producesSfg: true };
+    }
+    if (_TERMINAL.has(t)) return { practicalOperation: "Packaging", stageBucket: STAGE_FINAL_FG, producesSfg: false };
+    if (_INLINE.has(t)) return { practicalOperation: null, stageBucket: STAGE_INLINE, producesSfg: false };
+    return { practicalOperation: null, stageBucket: null, producesSfg: false };
+  });
+}
+
+// Single-token classification (no combine context). Prefer classifySteps when
+// the full step list is available so the Roasting/seasoning combine applies.
+export function classifyProcess(name: string | null | undefined): ProcessClass {
+  return classifySteps([name])[0];
 }
