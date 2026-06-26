@@ -48,7 +48,9 @@ export function TransferChrome({ title, children }: TransferChromeProps) {
 
       <footer className="border-t border-[var(--aws-border)] bg-white py-3 px-6 text-[11px] text-[var(--text-secondary)] flex flex-wrap justify-center gap-x-4 gap-y-1">
         <a href="#" className="hover:underline">Privacy</a>
-        <span>© {new Date().getFullYear()}</span>
+        {/* suppressHydrationWarning: the year reads the wall clock, so the SSR and
+            client values can differ across a New-Year boundary — harmless, so don't error. */}
+        <span suppressHydrationWarning>© {new Date().getFullYear()}</span>
       </footer>
     </div>
   );

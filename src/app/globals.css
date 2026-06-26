@@ -73,3 +73,26 @@ body {
 .form-input::placeholder {
   color: var(--text-muted);
 }
+
+/* Numeric-input hardening. Hides the native up/down spinner arrows; pair with
+   an onWheel→blur handler on the <input> so a stray mouse-wheel scroll over a
+   focused number field can't silently change its value. Applied to the
+   SO-creation plan-builder card + the SO line editor where operators type
+   pack counts / weights and accidental wheel edits were corrupting values. */
+.no-spinner::-webkit-outer-spin-button,
+.no-spinner::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.no-spinner {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* QR scanner ROI scan-line sweep (transfer-OUT camera scanner _QRScanner.tsx).
+   Drives the green line up/down inside the centred region-of-interest box. */
+@keyframes qrroi-scan {
+  0%   { top: 6%;  opacity: 0.35; }
+  50%  { top: 90%; opacity: 1; }
+  100% { top: 6%;  opacity: 0.35; }
+}

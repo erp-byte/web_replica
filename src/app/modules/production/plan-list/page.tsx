@@ -25,6 +25,7 @@ import {
   type PlanPagination,
   type PlanDetail,
   type PlanLineRow,
+  type PlanStepRow,
   type PlanBomLine,
   type PlanBomSummary,
   listPlans,
@@ -32,13 +33,20 @@ import {
   fetchPlanBom,
   createLineJobCards,
   replaceLineJobCards,
+  applyLiveJobCardEdits,
   fetchLineJobCardConfig,
+  searchCanonicalSfg,
+  fetchLineDispatchInfo,
+  createLineDispatch,
+  type LineDispatchInfo,
+  type DispatchBatch,
   fmtPlanKg,
+  fmtPlanUnits,
   fmtPlanDate,
   fmtDateRange,
 } from "@/lib/plans";
 import { FACTORY_TO_WAREHOUSE, FLOORS_BY_FACTORY, type FactoryCode } from "@/lib/planBuilder";
-import { PROCESS_OPTIONS } from "@/lib/processCatalog";
+import { PROCESS_OPTIONS, classifyProcess, STAGE_FINAL_FG } from "@/lib/processCatalog";
 
 const PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 300;
@@ -105,6 +113,7 @@ export default function PlanListPage() {
   // step — for now Continue just confirms the pick. This is the path that will
   // replace Approve once the full flow lands.
   const [jcPlan, setJcPlan] = useState<PlanRow | null>(null);
+  const [dispatchPlan, setDispatchPlan] = useState<PlanRow | null>(null);
 
   // Debounce search; bump page back to 1 on every change so a stale page
   // beyond the new result set isn't requested.
@@ -220,6 +229,7 @@ export default function PlanListPage() {
   const onOpen = useCallback((p: PlanRow) => {
     router.push(`/modules/production/plan-list/${p.plan_id}`);
   }, [router]);
+  const onDispatch = useCallback((p: PlanRow) => setDispatchPlan(p), []);
   const onPage = useCallback((p: number) => setPage(p), []);
 
   // Surface a thin, non-blocking progress bar whenever a fetch is in
@@ -346,6 +356,7 @@ export default function PlanListPage() {
                 onToggleExpand={onToggleExpand}
                 onOpen={onOpen}
                 onCreateJobCard={setJcPlan}
+                onDispatch={onDispatch}
               />
             </div>
             <Pagination pg={pagination} onPage={onPage} loading={loading} />
@@ -366,24 +377,52 @@ export default function PlanListPage() {
             // Same identity scheme the modal selects with (getLineId).
             const ln = (jcPlan.lines_summary ?? []).find((l, i) => getLineId(l, i) === p.planLineId);
             const article = ln?.fg_sku_name ?? "article";
-            const body = {
-              qty_kg: Number(p.qtyKg),
-              qty_units: p.qtyUnits.trim() !== "" ? Number(p.qtyUnits) : null,
-              wip_steps: p.wipSteps.map((s) => ({
-                process: s.process,
-                floor: s.floor,
-                sfg_output: s.sfgOutput || null,
-              })),
-              pkg_floor: p.pkgFloor,
-            };
+            const qtyUnits = p.qtyUnits.trim() !== "" ? Number(p.qtyUnits) : null;
             setToast(null);
             try {
-              if (p.mode === "edit") {
-                const r = await replaceLineJobCards(p.planLineId, body);
-                setToast(`Updated job cards for ${article} · ${r.count} stage${r.count === 1 ? "" : "s"} re-dispatched.`);
+              if (p.liveEdit) {
+                // Live (started-chain) edit: send each WIP step with its
+                // job_card_id (new rows omit it) + per-removed-card reasons.
+                // The server diffs against the existing chain and force-records
+                // any removed running stage before cancelling it.
+                const r = await applyLiveJobCardEdits(p.planLineId, {
+                  qty_kg: Number(p.qtyKg),
+                  qty_units: qtyUnits,
+                  steps: p.wipSteps.map((s) => ({
+                    job_card_id: s.jobCardId ?? null,
+                    process: s.process,
+                    floor: s.floor,
+                    sfg_output: s.sfgOutput || null,
+                  })),
+                  pkg_floor: p.pkgFloor,
+                  pkg_job_card_id: p.pkgJobCardId,
+                  remove_reasons: p.removeReasons,
+                });
+                const bits: string[] = [];
+                if (r.added) bits.push(`${r.added} added`);
+                if (r.removed) bits.push(`${r.removed} removed`);
+                if (r.floors_changed) bits.push(`${r.floors_changed} floor change${r.floors_changed === 1 ? "" : "s"}`);
+                if (r.qty_changed) bits.push("qty updated");
+                if (r.so_sync?.synced) bits.push("SO synced");
+                setToast(`Live-edited ${article}${bits.length ? " · " + bits.join(" · ") : ""}.`);
               } else {
-                const r = await createLineJobCards(p.planLineId, body);
-                setToast(`Created ${r.count} job card${r.count === 1 ? "" : "s"} for ${article} · dispatched to floors.`);
+                const body = {
+                  qty_kg: Number(p.qtyKg),
+                  qty_units: qtyUnits,
+                  wip_steps: p.wipSteps.map((s) => ({
+                    process: s.process,
+                    floor: s.floor,
+                    sfg_output: s.sfgOutput || null,
+                  })),
+                  pkg_floor: p.pkgFloor,
+                };
+                if (p.mode === "edit") {
+                  const r = await replaceLineJobCards(p.planLineId, body);
+                  setToast(`Updated job cards for ${article} · ${r.count} stage${r.count === 1 ? "" : "s"} re-dispatched.`);
+                } else {
+                  const r = await createLineJobCards(p.planLineId, body);
+                  setToast(`Created ${r.count} job card${r.count === 1 ? "" : "s"} for ${article} · dispatched to floors.`);
+                }
               }
               reload();
               return true;
@@ -395,7 +434,310 @@ export default function PlanListPage() {
         />
       ) : null}
 
+      {dispatchPlan ? (
+        <DispatchModal
+          plan={dispatchPlan}
+          onClose={() => setDispatchPlan(null)}
+          onToast={setToast}
+        />
+      ) : null}
+
       <Footer />
+    </div>
+  );
+}
+
+// ── Dispatch modal ─────────────────────────────────────────────────────────
+//
+// Opened by the per-plan "Dispatch" button. Per article: pick an article, pick a
+// PACKAGING batch (the batch selector is sourced from the packaging/Final-FG job
+// card only — never another WIP process), enter no. of boxes + customer location
+// + optional transport, then Send. The server emails To billing/candor_operations
+// /store_head, CC business_head/operations_head/inventory_manager/production_manager
+// with the job-card body and records it. Boxes + customer location + transport are
+// operator-entered (no stored source).
+
+function DispatchModal({
+  plan, onClose, onToast,
+}: {
+  plan: PlanRow;
+  onClose: () => void;
+  onToast: (msg: string | null) => void;
+}) {
+  const lines = plan.lines_summary ?? [];
+  const [selectedLineId, setSelectedLineId] = useState<number | null>(
+    lines.length === 1 ? (lines[0].plan_line_id ?? null) : null,
+  );
+  const [info, setInfo] = useState<LineDispatchInfo | null>(null);
+  const [loadingInfo, setLoadingInfo] = useState(false);
+  const [infoErr, setInfoErr] = useState<string | null>(null);
+  const [batchId, setBatchId] = useState<number | null>(null);
+  const [numBoxes, setNumBoxes] = useState("");
+  const [customerLocation, setCustomerLocation] = useState("");
+  const [vehicleNumber, setVehicleNumber] = useState("");
+  const [transporter, setTransporter] = useState("");
+  const [transportLocation, setTransportLocation] = useState("");
+  const [sending, setSending] = useState(false);
+
+  // Default a batch selection to the packaging stage's batches — prefer the
+  // latest CLOSED batch (produced FG ready to dispatch), else the last batch.
+  function defaultBatch(batches: DispatchBatch[]): number | null {
+    if (!batches.length) return null;
+    const closed = batches.filter((b) => (b.status || "").toLowerCase() === "closed");
+    const pick = (closed.length ? closed : batches)[(closed.length ? closed : batches).length - 1];
+    return pick.batch_id ?? null;
+  }
+
+  // Load the packaging job-card + batches whenever the chosen article changes.
+  useEffect(() => {
+    const c = new AbortController();
+    void (async () => {
+      if (selectedLineId == null) {
+        setInfo(null); setInfoErr(null); setLoadingInfo(false); setBatchId(null);
+        return;
+      }
+      setLoadingInfo(true); setInfoErr(null);
+      try {
+        const d = await fetchLineDispatchInfo(selectedLineId);
+        if (c.signal.aborted) return;
+        setInfo(d);
+        setBatchId(d.exists ? defaultBatch(d.batches ?? []) : null);
+        setCustomerLocation("");
+      } catch (e) {
+        if (!c.signal.aborted) { setInfo(null); setInfoErr(friendlyApiError(e)); }
+      } finally {
+        if (!c.signal.aborted) setLoadingInfo(false);
+      }
+    })();
+    return () => c.abort();
+  }, [selectedLineId]);
+
+  const batch = (info?.batches ?? []).find((b) => b.batch_id === batchId) ?? null;
+  const canSend = selectedLineId != null && info?.exists === true && batchId != null && !sending;
+
+  async function send() {
+    if (selectedLineId == null || batchId == null) return;
+    setSending(true);
+    onToast(null);
+    try {
+      const r = await createLineDispatch(selectedLineId, {
+        batch_id: batchId,
+        num_boxes: numBoxes.trim() !== "" ? Number(numBoxes) : null,
+        customer_location: customerLocation.trim() || null,
+        vehicle_number: vehicleNumber.trim() || null,
+        transporter: transporter.trim() || null,
+        transport_location: transportLocation.trim() || null,
+      });
+      const who = [...(r.to ?? []), ...(r.cc ?? [])].length;
+      onToast(
+        r.email_sent
+          ? `Dispatch sent for ${info?.fg_sku_name ?? "article"} · emailed ${who} recipient${who === 1 ? "" : "s"}.`
+          : `Dispatch recorded for ${info?.fg_sku_name ?? "article"} (no email — SMTP off or no recipients assigned).`,
+      );
+      onClose();
+    } catch (e) {
+      onToast(`Dispatch failed: ${friendlyApiError(e)}`);
+      setSending(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Dispatch"
+    >
+      <div
+        className="bg-white rounded-md shadow-[0_8px_28px_rgba(0,28,36,0.28)] w-full max-w-[480px] max-h-[85vh] flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-4 py-3 border-b border-[var(--aws-border)] flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <h2 className="text-[14px] font-semibold text-[var(--text-primary)]">Dispatch to</h2>
+            <p className="text-[11px] text-[var(--text-secondary)] mt-0.5 truncate">
+              {plan.plan_name || `Plan #${plan.plan_id}`} · packaging → billing / operations / stores
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="shrink-0 w-7 h-7 inline-flex items-center justify-center rounded-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--surface-subtle)]"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="overflow-y-auto p-4 space-y-4">
+          {/* Article picker (per article) */}
+          <div>
+            <span className="block text-[11px] uppercase tracking-wide font-semibold text-[var(--text-secondary)] mb-1.5">Article</span>
+            {lines.length === 0 ? (
+              <p className="text-[12px] text-[var(--text-muted)] italic">This plan has no articles.</p>
+            ) : (
+              <ul className="space-y-1">
+                {lines.map((l, i) => {
+                  const id = l.plan_line_id ?? null;
+                  const disabled = id == null;
+                  const checked = selectedLineId === id && id != null;
+                  return (
+                    <li key={id ?? `idx-${i}`}>
+                      <label className={[
+                        "flex items-center gap-2.5 px-3 py-2 rounded-sm border transition-colors",
+                        disabled ? "opacity-50 cursor-not-allowed border-[var(--aws-border)]"
+                          : checked ? "border-[#1d8102] bg-[#eef7ee] cursor-pointer"
+                          : "border-[var(--aws-border)] hover:border-[var(--aws-navy)] cursor-pointer",
+                      ].join(" ")}>
+                        <input
+                          type="radio"
+                          name="dispatch-article"
+                          checked={checked}
+                          disabled={disabled}
+                          onChange={() => { if (id != null) { setSelectedLineId(id); } }}
+                          className="accent-[#1d8102]"
+                        />
+                        <span className="flex-1 min-w-0">
+                          <span className="text-[13px] text-[var(--text-primary)] truncate block" title={l.fg_sku_name ?? ""}>
+                            {l.fg_sku_name || "—"}
+                          </span>
+                          {(l.job_card_count ?? 0) > 0 ? (
+                            <span className="text-[10px] text-[var(--text-muted)]">has job cards</span>
+                          ) : (
+                            <span className="text-[10px] text-[var(--aws-error)]">no job cards yet</span>
+                          )}
+                        </span>
+                      </label>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+
+          {selectedLineId == null ? null : loadingInfo ? (
+            <p className="text-[11px] text-[var(--text-secondary)] flex items-center gap-2">
+              <span className="inline-block w-3 h-3 border-2 border-[var(--aws-border-strong)] border-t-[#1d8102] rounded-full animate-spin" />
+              Loading packaging job card…
+            </p>
+          ) : infoErr ? (
+            <p className="text-[11px] text-[var(--aws-error)]">{infoErr}</p>
+          ) : info && !info.exists ? (
+            <p className="px-2 py-1.5 text-[11px] rounded border text-[#9a393e] border-[var(--aws-border)] bg-[#fdf0f1]">
+              This article has no packaging job card yet — dispatch becomes available once its packaging stage exists.
+            </p>
+          ) : info && info.exists ? (
+            <>
+              {!info.packaging_completed ? (
+                <p className="px-2 py-1.5 text-[11px] rounded border text-[#664d03] border-[#ffe69c] bg-[#fff8e6]">
+                  Packaging stage is not marked complete yet ({info.packaging_status}). You can still dispatch a closed batch.
+                </p>
+              ) : null}
+
+              {/* Batch selector — packaging stage only, defaults to the latest closed batch */}
+              <label className="block">
+                <span className="block text-[11px] font-semibold text-[var(--text-primary)] mb-1">
+                  Packaging batch (phase) <span className="text-[var(--aws-error)]">*</span>
+                </span>
+                {(info.batches ?? []).length === 0 ? (
+                  <p className="text-[11px] text-[var(--text-muted)] italic">No packaging batches yet.</p>
+                ) : (
+                  <select
+                    value={batchId ?? ""}
+                    onChange={(e) => setBatchId(e.target.value ? Number(e.target.value) : null)}
+                    className="w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#1d8102] focus:shadow-[0_0_0_1px_#1d8102]"
+                  >
+                    {(info.batches ?? []).map((b) => (
+                      <option key={b.batch_id} value={b.batch_id}>
+                        Batch {b.batch_number}{b.status ? ` · ${b.status}` : ""} — {fmtPlanKg(b.qty_kg)} kg{b.qty_units ? ` / ${fmtPlanUnits(b.qty_units)} pcs` : ""}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </label>
+
+              {/* Auto-filled job card details (read-only) */}
+              <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[12px] bg-[var(--surface-subtle)] border border-[var(--aws-border)] rounded p-2.5">
+                <DispatchKV label="Job card" value={info.job_card_number} mono />
+                <DispatchKV label="Phase / batch" value={batch ? `#${batch.batch_number}` : undefined} />
+                <DispatchKV label="Qty (kg)" value={batch ? `${fmtPlanKg(batch.qty_kg)} kg` : undefined} />
+                <DispatchKV label="Qty (units)" value={batch && batch.qty_units ? `${fmtPlanUnits(batch.qty_units)} pcs` : "—"} />
+                <DispatchKV label="Warehouse" value={info.warehouse} />
+                <DispatchKV label="Floor" value={info.floor} />
+                <DispatchKV label="Customer" value={info.customer_name} />
+              </dl>
+
+              {/* Operator-entered (no stored source) */}
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="block text-[11px] font-semibold text-[var(--text-primary)] mb-1">No. of boxes</span>
+                  <input
+                    type="number" min="0" step="1" value={numBoxes}
+                    onChange={(e) => setNumBoxes(e.target.value)} placeholder="0"
+                    className="w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#1d8102] focus:shadow-[0_0_0_1px_#1d8102]"
+                  />
+                </label>
+                <label className="block">
+                  <span className="block text-[11px] font-semibold text-[var(--text-primary)] mb-1">Customer location</span>
+                  <input
+                    value={customerLocation} onChange={(e) => setCustomerLocation(e.target.value)}
+                    placeholder="City / ship-to"
+                    className="w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#1d8102] focus:shadow-[0_0_0_1px_#1d8102]"
+                  />
+                </label>
+              </div>
+
+              <div>
+                <span className="block text-[11px] uppercase tracking-wide font-semibold text-[var(--text-secondary)] mb-1.5">Transport (optional)</span>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <input value={vehicleNumber} onChange={(e) => setVehicleNumber(e.target.value)} placeholder="Vehicle number"
+                    className="w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#1d8102] focus:shadow-[0_0_0_1px_#1d8102]" />
+                  <input value={transporter} onChange={(e) => setTransporter(e.target.value)} placeholder="Transporter"
+                    className="w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#1d8102] focus:shadow-[0_0_0_1px_#1d8102]" />
+                  <input value={transportLocation} onChange={(e) => setTransportLocation(e.target.value)} placeholder="Location"
+                    className="w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#1d8102] focus:shadow-[0_0_0_1px_#1d8102]" />
+                </div>
+              </div>
+
+              <p className="text-[10px] text-[var(--text-muted)]">
+                To: billing · candor operations · stores. CC: business heads · operation head · inventory manager · production manager.
+              </p>
+            </>
+          ) : null}
+        </div>
+
+        <div className="px-4 py-3 border-t border-[var(--aws-border)] flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="h-8 px-3 text-[12px] rounded-[2px] border border-[var(--aws-border-strong)] bg-white hover:border-[var(--aws-navy)]"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={!canSend}
+            onClick={send}
+            className="h-8 px-4 text-[12px] rounded-[2px] font-semibold border bg-[#1d8102] border-[#176a02] hover:bg-[#176a02] text-white disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {sending ? "Sending…" : "Send dispatch"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DispatchKV({ label, value, mono }: { label: string; value?: string | number | null; mono?: boolean }) {
+  return (
+    <div className="min-w-0">
+      <div className="uppercase tracking-wide font-semibold text-[var(--text-muted)] text-[9px] leading-[12px]">{label}</div>
+      <div className={["text-[12px] leading-[16px] text-[var(--text-primary)] truncate", mono ? "font-mono" : ""].join(" ")}>
+        {value == null || value === "" ? "—" : value}
+      </div>
     </div>
   );
 }
@@ -573,13 +915,14 @@ function SummaryStrip({
 // ── Plans list (table + mobile cards) ────────────────────────────────────
 
 function PlansList({
-  rows, expandedPlanId, onToggleExpand, onOpen, onCreateJobCard,
+  rows, expandedPlanId, onToggleExpand, onOpen, onCreateJobCard, onDispatch,
 }: {
   rows: PlanRow[];
   expandedPlanId: number | null;
   onToggleExpand: (p: PlanRow) => void;
   onOpen:    (p: PlanRow) => void;
   onCreateJobCard: (p: PlanRow) => void;
+  onDispatch: (p: PlanRow) => void;
 }) {
   // The handlers are passed through verbatim — the row components apply
   // the per-row binding internally.  Wrapping callbacks here with an
@@ -597,6 +940,7 @@ function PlansList({
             onToggleExpand={onToggleExpand}
             onOpen={onOpen}
             onCreateJobCard={onCreateJobCard}
+            onDispatch={onDispatch}
           />
         ))}
       </div>
@@ -614,6 +958,7 @@ function PlansList({
                 <Th>Status</Th>
                 <Th right>Lines</Th>
                 <Th right>Volume</Th>
+                <Th right>Units</Th>
                 <Th>Created</Th>
                 <Th />
               </tr>
@@ -627,6 +972,7 @@ function PlansList({
                   onToggleExpand={onToggleExpand}
                   onOpen={onOpen}
                   onCreateJobCard={onCreateJobCard}
+                  onDispatch={onDispatch}
                 />
               ))}
             </tbody>
@@ -708,13 +1054,14 @@ function Th({ children, right }: { children?: React.ReactNode; right?: boolean }
 // given row's data changed.  Parent-supplied callbacks are stabilised
 // with useCallback so this memo isn't busted by new function identities.
 const PlanRowDesktop = memo(function PlanRowDesktop({
-  row, expanded, onToggleExpand, onOpen, onCreateJobCard,
+  row, expanded, onToggleExpand, onOpen, onCreateJobCard, onDispatch,
 }: {
   row: PlanRow;
   expanded: boolean;
   onToggleExpand: (p: PlanRow) => void;
   onOpen: (p: PlanRow) => void;
   onCreateJobCard: (p: PlanRow) => void;
+  onDispatch: (p: PlanRow) => void;
 }) {
   // Any article already carded ⇒ the row's action is "Edit Job Card".
   const hasJobCards = (row.lines_summary ?? []).some((l) => (l.job_card_count ?? 0) > 0);
@@ -723,6 +1070,7 @@ const PlanRowDesktop = memo(function PlanRowDesktop({
   const handleToggle = useCallback(() => onToggleExpand(row), [onToggleExpand, row]);
   const handleOpen = useCallback(() => onOpen(row), [onOpen, row]);
   const handleCreateJobCard = useCallback(() => onCreateJobCard(row), [onCreateJobCard, row]);
+  const handleDispatch = useCallback(() => onDispatch(row), [onDispatch, row]);
   return (
     <>
     <tr
@@ -781,7 +1129,15 @@ const PlanRowDesktop = memo(function PlanRowDesktop({
       <td className="px-2.5 py-1.5 text-right whitespace-nowrap">
         <span className="font-semibold">{fmtPlanKg(row.total_planned_kg)} kg</span>
       </td>
+      <td className="px-2.5 py-1.5 text-right whitespace-nowrap font-mono text-[var(--text-secondary)]">
+        {row.total_planned_units != null ? `${fmtPlanUnits(row.total_planned_units)} pcs` : "—"}
+      </td>
       <td className="px-2.5 py-1.5 text-[var(--text-muted)] whitespace-nowrap text-[11px]">
+        {row.created_by ? (
+          <span className="block text-[var(--text-secondary)] font-medium truncate max-w-[140px]" title={row.created_by}>
+            {row.created_by}
+          </span>
+        ) : null}
         {fmtPlanDate(row.created_at)}
       </td>
       <td className="px-2.5 py-1.5 text-right">
@@ -789,12 +1145,13 @@ const PlanRowDesktop = memo(function PlanRowDesktop({
           hasJobCards={hasJobCards}
           onOpen={handleOpen}
           onCreateJobCard={handleCreateJobCard}
+          onDispatch={handleDispatch}
         />
       </td>
     </tr>
     {expanded ? (
       <tr className="border-b border-[var(--aws-border)] bg-[var(--surface-subtle)]">
-        <td colSpan={9} className="px-3 py-3">
+        <td colSpan={10} className="px-3 py-3">
           <PlanInlinePreview planId={row.plan_id} onOpen={handleOpen} />
         </td>
       </tr>
@@ -804,18 +1161,20 @@ const PlanRowDesktop = memo(function PlanRowDesktop({
 });
 
 const PlanMobileCard = memo(function PlanMobileCard({
-  row, expanded, onToggleExpand, onOpen, onCreateJobCard,
+  row, expanded, onToggleExpand, onOpen, onCreateJobCard, onDispatch,
 }: {
   row: PlanRow;
   expanded: boolean;
   onToggleExpand: (p: PlanRow) => void;
   onOpen: (p: PlanRow) => void;
   onCreateJobCard: (p: PlanRow) => void;
+  onDispatch: (p: PlanRow) => void;
 }) {
   const hasJobCards = (row.lines_summary ?? []).some((l) => (l.job_card_count ?? 0) > 0);
   const handleToggle = useCallback(() => onToggleExpand(row), [onToggleExpand, row]);
   const handleOpen = useCallback(() => onOpen(row), [onOpen, row]);
   const handleCreateJobCard = useCallback(() => onCreateJobCard(row), [onCreateJobCard, row]);
+  const handleDispatch = useCallback(() => onDispatch(row), [onDispatch, row]);
   return (
     <div
       className="bg-white border border-[var(--aws-border)] rounded-md overflow-hidden cursor-pointer hover:border-[var(--aws-navy)]"
@@ -855,9 +1214,17 @@ const PlanMobileCard = memo(function PlanMobileCard({
           ) : null}
           <span className="text-[var(--text-muted)]">{fmtDateRange(row.date_from, row.date_to)}</span>
         </div>
-        <div className="flex items-center gap-3 text-[11px] mb-1.5">
+        <div className="flex items-center flex-wrap gap-x-3 gap-y-0.5 text-[11px] mb-1.5">
           <span><span className="text-[var(--text-muted)]">Lines</span> <strong>{row.line_count ?? 0}</strong></span>
           <span><span className="text-[var(--text-muted)]">Volume</span> <strong>{fmtPlanKg(row.total_planned_kg)} kg</strong></span>
+          {row.total_planned_units != null ? (
+            <span><span className="text-[var(--text-muted)]">Units</span> <strong>{fmtPlanUnits(row.total_planned_units)} pcs</strong></span>
+          ) : null}
+        </div>
+        <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)] mb-1.5">
+          <span className="uppercase tracking-wide font-semibold">Created</span>
+          {row.created_by ? <span className="text-[var(--text-secondary)] font-medium truncate max-w-[160px]" title={row.created_by}>{row.created_by}</span> : null}
+          <span>· {fmtPlanDate(row.created_at)}</span>
         </div>
         <ArticleSummary
           summary={row.lines_summary}
@@ -868,6 +1235,7 @@ const PlanMobileCard = memo(function PlanMobileCard({
             hasJobCards={hasJobCards}
             onOpen={handleOpen}
             onCreateJobCard={handleCreateJobCard}
+            onDispatch={handleDispatch}
           />
         </div>
       </div>
@@ -881,11 +1249,12 @@ const PlanMobileCard = memo(function PlanMobileCard({
 });
 
 function RowActions({
-  hasJobCards, onOpen, onCreateJobCard,
+  hasJobCards, onOpen, onCreateJobCard, onDispatch,
 }: {
   hasJobCards: boolean;
   onOpen: () => void;
   onCreateJobCard: () => void;
+  onDispatch: () => void;
 }) {
   return (
     <div className="inline-flex items-center gap-1.5">
@@ -922,6 +1291,19 @@ function RowActions({
           <polyline points="12 5 19 12 12 19" />
         </svg>
       </button>
+      {/* Dispatch to — only meaningful once an article's packaging stage is
+          done; the modal/server confirm readiness per batch. */}
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); onDispatch(); }}
+        title="Dispatch a completed packaging batch (notify billing / operations / stores)"
+        className="h-7 px-2.5 text-[11px] rounded-[2px] border border-[var(--aws-border)] bg-white text-[#1d8102] hover:border-[#1d8102] inline-flex items-center gap-1"
+      >
+        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+          <rect x="1" y="3" width="15" height="13" /><polygon points="16 8 20 8 23 11 23 16 16 16 16 8" /><circle cx="5.5" cy="18.5" r="2.5" /><circle cx="18.5" cy="18.5" r="2.5" />
+        </svg>
+        Dispatch
+      </button>
     </div>
   );
 }
@@ -956,6 +1338,9 @@ function CreateJobCardModal({
     wipSteps: WipStep[];
     pkgFloor: string;
     mode: "create" | "edit";
+    liveEdit: boolean;
+    pkgJobCardId: number | null;
+    removeReasons: Record<string, string>;
   }) => Promise<boolean>;
 }) {
   const lines = plan.lines_summary ?? [];
@@ -983,10 +1368,18 @@ function CreateJobCardModal({
   const [mode, setMode] = useState<"create" | "edit">("create");
   const [editable, setEditable] = useState(true);
   const [loadingCfg, setLoadingCfg] = useState(false);
+  // Live-edit (started chain): floor/qty change anytime, add in the un-started
+  // tail, remove with a forced JC-data record. `chainStarted` flips the modal
+  // from the un-started full-replace path to the live apply-edits path.
+  const [chainStarted, setChainStarted] = useState(false);
+  const [pkgJobCardId, setPkgJobCardId] = useState<number | null>(null);
+  const [removeReasons, setRemoveReasons] = useState<Record<string, string>>({});
+  // Canonical SFG name for the selected article (auto-fill, design §5.4).
+  const [canonicalSfg, setCanonicalSfg] = useState("");
+  const liveEdit = mode === "edit" && chainStarted;
 
   const selectedLine = lines.find((l, i) => getLineId(l, i) === selected) ?? null;
   const selectedBomId = selectedLine?.bom_id ?? null;
-  const selectedCarded = (selectedLine?.job_card_count ?? 0) > 0;
 
   // Load the full BOM (no 30-line cap) whenever the chosen article changes.
   // Async-IIFE + AbortController is this file's accepted fetch-in-effect shape
@@ -1027,27 +1420,53 @@ function CreateJobCardModal({
 
   async function goNext() {
     if (selected == null) return;
-    if (selectedCarded && selectedLine?.plan_line_id != null) {
-      // Editing an already-carded article — prefill step 2 from its chain.
+    const planLineId = selectedLine?.plan_line_id ?? null;
+    if (planLineId != null) {
+      // Fetch the line config (cheap even when no cards exist) — it carries the
+      // canonical SFG for auto-fill (§5.4) and, when carded, the existing chain.
       setLoadingCfg(true);
       try {
-        const cfg = await fetchLineJobCardConfig(selectedLine.plan_line_id);
+        const cfg = await fetchLineJobCardConfig(planLineId);
+        const canon = cfg.canonical_sfg ?? "";
+        setCanonicalSfg(canon);
         if (cfg.exists) {
           setMode("edit");
           setEditable(cfg.editable !== false);
+          setChainStarted(cfg.started === true);
+          setPkgJobCardId(cfg.pkg_job_card_id ?? null);
+          setRemoveReasons({});
           setQtyKg(cfg.qty_kg != null ? String(cfg.qty_kg) : "");
           setQtyUnits(cfg.qty_units != null ? String(cfg.qty_units) : "");
           setWipSteps(
             cfg.wip_steps && cfg.wip_steps.length
-              ? cfg.wip_steps.map((s) => ({ process: s.process ?? "", floor: s.floor ?? "", sfgOutput: s.sfg_output ?? "" }))
-              : [{ process: "", floor: "", sfgOutput: "" }],
+              ? cfg.wip_steps.map((s) => ({
+                  process: s.process ?? "",
+                  floor: s.floor ?? "",
+                  // Auto-fill the canonical SFG for articles that have one
+                  // (overwrites a prior free-typed value); fall back to the
+                  // saved value only when there's no canonical. Stays editable.
+                  sfgOutput: canon || (s.sfg_output ?? ""),
+                  jobCardId: s.job_card_id ?? null,
+                  started: s.started === true,
+                }))
+              : [{ process: "", floor: "", sfgOutput: canon }],
           );
           setPkgFloor(cfg.pkg_floor ?? "");
         } else {
           setMode("create");
+          setChainStarted(false);
+          if (qtyKg === "" && selectedLine?.planned_qty_kg != null) {
+            setQtyKg(String(selectedLine.planned_qty_kg));
+          }
+          if (qtyUnits === "" && selectedLine?.planned_qty_units != null && selectedLine.planned_qty_units !== "") {
+            setQtyUnits(String(selectedLine.planned_qty_units));
+          }
+          // Fresh chain: seed the first WIP step's SFG output with the canonical name.
+          setWipSteps((prev) => prev.map((x, idx) => (idx === 0 && !x.sfgOutput ? { ...x, sfgOutput: canon } : x)));
         }
       } catch {
         setMode("create");   // fall back to a create attempt; the server still guards
+        setChainStarted(false);
       } finally {
         setLoadingCfg(false);
       }
@@ -1072,8 +1491,15 @@ function CreateJobCardModal({
   const wipOk = wipSteps.length > 0 && wipSteps.every((s) => s.process !== "" && s.floor !== "");
   const canCreate =
     qtyKg.trim() !== "" && Number(qtyKg) > 0 && wipOk && pkgFloor !== "";
-  // In edit mode a started chain can't be replaced, so saving is blocked.
-  const canSubmit = canCreate && (mode === "create" || editable);
+  // Create + un-started edit go through the replace path (needs `editable`);
+  // a started chain goes through the live apply-edits path (always submittable).
+  const canSubmit = canCreate && (mode === "create" || editable || liveEdit);
+
+  // Remove a WIP row. A started row force-records its job-card data on the
+  // server, so we capture a reason first (the operator must confirm).
+  function onRemoveStartedReason(jobCardId: number, reason: string) {
+    setRemoveReasons((m) => ({ ...m, [String(jobCardId)]: reason }));
+  }
 
   // Soft over-qty hint. Producing more than the line's planned kg can be
   // legitimate (catch-up / rework), so we don't block — but an accidental
@@ -1153,6 +1579,9 @@ function CreateJobCardModal({
                               setQtyUnits("");
                               setMode("create");
                               setEditable(true);
+                              setChainStarted(false);
+                              setPkgJobCardId(null);
+                              setRemoveReasons({});
                             }
                           }}
                           className="accent-[var(--aws-orange)]"
@@ -1241,7 +1670,15 @@ function CreateJobCardModal({
                     Add process
                   </button>
                 </div>
-                <WipProcessList steps={wipSteps} floors={floors} onChange={setWipSteps} />
+                <WipProcessList
+                  steps={wipSteps}
+                  floors={floors}
+                  onChange={setWipSteps}
+                  liveEdit={liveEdit}
+                  onRemoveStarted={onRemoveStartedReason}
+                  canonicalSfg={canonicalSfg}
+                  entity={plan.entity ?? undefined}
+                />
               </div>
 
               {/* Packaging — single floor */}
@@ -1254,9 +1691,12 @@ function CreateJobCardModal({
               ) : null}
             </div>
 
-            {mode === "edit" && !editable ? (
-              <p className="px-2 py-1.5 text-[11px] rounded border text-[#9a393e] border-[var(--aws-border)] bg-[#fdf0f1]">
-                These job cards have already started — they can&apos;t be edited.
+            {liveEdit ? (
+              <p className="px-2 py-1.5 text-[11px] rounded border text-[#664d03] border-[#ffe69c] bg-[#fff8e6]">
+                <strong>Live edit</strong> — some stages have started. You can change floors and
+                quantity, and add new processes. Started processes (badged) keep their step but
+                can&apos;t be reordered; removing one records its job-card data, then cancels it.
+                Quantity changes update the linked sales order.
               </p>
             ) : null}
 
@@ -1318,7 +1758,10 @@ function CreateJobCardModal({
                   disabled={!canSubmit || creating}
                   onClick={async () => {
                     setCreating(true);
-                    const ok = await onContinue({ planLineId: selected, qtyKg, qtyUnits, wipSteps, pkgFloor, mode });
+                    const ok = await onContinue({
+                      planLineId: selected, qtyKg, qtyUnits, wipSteps, pkgFloor, mode,
+                      liveEdit, pkgJobCardId, removeReasons,
+                    });
                     if (ok) onClose();        // success → modal unmounts
                     else setCreating(false);  // failure → stay open (toast shows why)
                   }}
@@ -1343,18 +1786,59 @@ function CreateJobCardModal({
 // floor only when the selected rows agree (conflict → blank, operator re-picks),
 // matching planning's mergeCardSteps. State (drag + merge-selection) is local;
 // committed changes flow up through onChange.
-type WipStep = { process: string; floor: string; sfgOutput: string };
+type WipStep = {
+  process: string;
+  floor: string;
+  sfgOutput: string;
+  // Set when this row maps to an existing job card (live edit). `started` is
+  // true once that card has progressed past locked/unlocked — the process can
+  // no longer be changed/reordered, only its floor; removal force-records it.
+  jobCardId?: number | null;
+  started?: boolean;
+};
 
 function WipProcessList({
-  steps, floors, onChange,
+  steps, floors, onChange, liveEdit = false, onRemoveStarted, canonicalSfg = "", entity,
 }: {
   steps: WipStep[];
   floors: string[];
   onChange: (next: WipStep[]) => void;
+  // Live edit of a started chain: started rows lock their process + reordering
+  // (floor stays editable) and removal force-records the job card first.
+  liveEdit?: boolean;
+  onRemoveStarted?: (jobCardId: number, reason: string) => void;
+  // Canonical SFG name for the article — drives the auto-fill placeholder + the
+  // non-match warning / "Use canonical" affordance (design §5.4).
+  canonicalSfg?: string;
+  // Plan entity (cfpl/cdpl) — scopes the SFG catalogue typeahead ranking.
+  entity?: string;
 }) {
   const dragFromRef = useRef<number | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
   const [selectedIdxs, setSelectedIdxs] = useState<Set<number>>(new Set());
+
+  // SFG catalogue typeahead (design §5.4): a single shared <datalist> fed by a
+  // debounced search of whichever SFG field is being edited; every SFG input
+  // binds to it via list=. Free-text stays allowed.
+  const [sfgSuggestions, setSfgSuggestions] = useState<string[]>([]);
+  const sfgSearch = useRef<{ t: ReturnType<typeof setTimeout> | null; ctrl: AbortController | null }>({ t: null, ctrl: null });
+  function searchSfg(term: string) {
+    const s = sfgSearch.current;
+    if (s.t) clearTimeout(s.t);
+    if (!term.trim()) { setSfgSuggestions([]); return; }
+    s.t = setTimeout(() => {
+      s.ctrl?.abort();
+      const ctrl = new AbortController();
+      s.ctrl = ctrl;
+      void searchCanonicalSfg(term, entity, 20, ctrl.signal).then((rows) => {
+        if (!ctrl.signal.aborted) setSfgSuggestions(rows.map((r) => r.sfg_name));
+      });
+    }, 250);
+  }
+  useEffect(() => {
+    const s = sfgSearch.current;
+    return () => { if (s.t) clearTimeout(s.t); s.ctrl?.abort(); };
+  }, []);
 
   // Merge is one-shot — once the list length changes the indices no longer
   // line up, so clear the selection. Deferred past the effect body to satisfy
@@ -1378,6 +1862,20 @@ function WipProcessList({
   }
   function remove(i: number) {
     if (steps.length <= 1) return;
+    const s = steps[i];
+    // Removing a running stage force-records its job-card data, then cancels —
+    // confirm + capture a reason before dropping the row.
+    if (liveEdit && s.started && s.jobCardId != null) {
+      const entered = typeof window !== "undefined"
+        ? window.prompt(
+            `Remove the running process "${s.process || "this stage"}"?\n` +
+            "Its job-card data is recorded, then the process is cancelled.\n\nReason:",
+            "",
+          )
+        : "";
+      if (entered == null) return;   // operator cancelled the prompt
+      onRemoveStarted?.(s.jobCardId, entered.trim() || "Removed via live edit");
+    }
     onChange(steps.filter((_, j) => j !== i));
   }
   function toggleSelect(i: number) {
@@ -1416,9 +1914,15 @@ function WipProcessList({
 
   return (
     <div>
+      {/* Shared SFG catalogue suggestions for every SFG input's `list=`. */}
+      <datalist id="sfg-canon-options">
+        {sfgSuggestions.map((name) => <option key={name} value={name} />)}
+      </datalist>
       {/* Process checklist toolbar — a checkbox per process (below) plus
-          Select-all + Merge here. Always shown; Merge stays disabled until 2+
-          processes are checked. Mirrors the planning page's StepsSection. */}
+          Select-all + Merge here. Merge stays disabled until 2+ processes are
+          checked. Hidden during live edit (started rows must keep their order /
+          identity, so merge/reorder is disabled). */}
+      {liveEdit ? null : (
       <div className="flex flex-wrap items-center gap-2 mb-1.5 px-2 py-1.5 bg-[var(--surface-subtle)] border border-[var(--aws-border)] rounded">
           <label className="inline-flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] cursor-pointer">
             <input
@@ -1453,15 +1957,17 @@ function WipProcessList({
             Merge processes
           </button>
       </div>
+      )}
 
       <ol className="space-y-1.5">
         {steps.map((s, i) => {
           const isDragOver = dragOverIdx === i;
+          const rowStarted = liveEdit && s.started === true;
           return (
             <li
-              key={`${s.process}-${i}`}
-              draggable
-              onDragStart={(e) => { dragFromRef.current = i; e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", String(i)); }}
+              key={`${s.jobCardId ?? s.process}-${i}`}
+              draggable={!liveEdit}
+              onDragStart={(e) => { if (liveEdit) return; dragFromRef.current = i; e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", String(i)); }}
               onDragEnd={() => { dragFromRef.current = null; setDragOverIdx(null); }}
               onDragOver={(e) => { if (dragFromRef.current == null) return; e.preventDefault(); setDragOverIdx(i); }}
               onDragLeave={() => setDragOverIdx((c) => (c === i ? null : c))}
@@ -1476,23 +1982,32 @@ function WipProcessList({
                   type="checkbox"
                   checked={selectedIdxs.has(i)}
                   onChange={() => toggleSelect(i)}
-                  title="Select to merge"
-                  className="accent-[var(--aws-orange)] shrink-0"
+                  disabled={rowStarted}
+                  title={rowStarted ? "Running stages can't be merged" : "Select to merge"}
+                  className="accent-[var(--aws-orange)] shrink-0 disabled:opacity-30"
                 />
-                <span aria-hidden title="Drag to reorder" className="shrink-0 inline-flex items-center justify-center w-4 h-7 text-[var(--text-muted)] cursor-grab active:cursor-grabbing">
-                  <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
-                    <circle cx="9" cy="6" r="1.4" /><circle cx="15" cy="6" r="1.4" /><circle cx="9" cy="12" r="1.4" /><circle cx="15" cy="12" r="1.4" /><circle cx="9" cy="18" r="1.4" /><circle cx="15" cy="18" r="1.4" />
-                  </svg>
-                </span>
-                <span className="shrink-0 inline-flex items-center justify-center w-5 h-5 rounded-full bg-[var(--aws-navy)] text-white text-[10px] font-bold">{i + 1}</span>
+                {liveEdit ? null : (
+                  <span aria-hidden title="Drag to reorder" className="shrink-0 inline-flex items-center justify-center w-4 h-7 text-[var(--text-muted)] cursor-grab active:cursor-grabbing">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                      <circle cx="9" cy="6" r="1.4" /><circle cx="15" cy="6" r="1.4" /><circle cx="9" cy="12" r="1.4" /><circle cx="15" cy="12" r="1.4" /><circle cx="9" cy="18" r="1.4" /><circle cx="15" cy="18" r="1.4" />
+                    </svg>
+                  </span>
+                )}
+                <span className={["shrink-0 inline-flex items-center justify-center w-5 h-5 rounded-full text-white text-[10px] font-bold", rowStarted ? "bg-[#1d8102]" : "bg-[var(--aws-navy)]"].join(" ")} title={rowStarted ? "Running" : undefined}>{i + 1}</span>
+                {rowStarted ? (
+                  <span className="shrink-0 px-1 py-0.5 text-[9px] font-bold uppercase rounded-[2px] border bg-[#eef7ee] text-[#2e7d32] border-[#bfe0c0]" title="This stage has started">
+                    Running
+                  </span>
+                ) : null}
                 {/* Process + floor stacked in one aligned column; the process
                     name truncates with … and shows full on hover (title). */}
                 <div className="flex-1 min-w-0 space-y-1">
                   <select
                     value={s.process}
                     onChange={(e) => setField(i, { process: e.target.value })}
-                    title={s.process || undefined}
-                    className="w-full truncate h-7 px-1.5 text-[12px] font-semibold rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
+                    disabled={rowStarted}
+                    title={rowStarted ? "Process can't change once started — remove it to replace" : (s.process || undefined)}
+                    className="w-full truncate h-7 px-1.5 text-[12px] font-semibold rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e] disabled:bg-[var(--surface-subtle)] disabled:text-[var(--text-secondary)]"
                   >
                     <option value="">— Process —</option>
                     {PROCESS_OPTIONS.map((p) => <option key={p} value={p}>{p}</option>)}
@@ -1516,18 +2031,42 @@ function WipProcessList({
                     />
                   )}
                   <input
+                    list="sfg-canon-options"
                     value={s.sfgOutput}
-                    onChange={(e) => setField(i, { sfgOutput: e.target.value })}
+                    onChange={(e) => { setField(i, { sfgOutput: e.target.value }); searchSfg(e.target.value); }}
                     title={s.sfgOutput || undefined}
-                    placeholder="SFG output (e.g. SFG0042)"
+                    placeholder={canonicalSfg || "SFG output — search catalogue…"}
                     className="w-full truncate h-7 px-1.5 text-[12px] rounded-[2px] bg-white border border-[var(--aws-border-strong)] outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_1px_#9a393e]"
                   />
+                  {/* Canonical-SFG affordance (design §5.4): show the catalogue
+                      value; warn + offer one-click apply when the typed value
+                      diverges, so any drift stays visible and auditable. */}
+                  {canonicalSfg ? (
+                    s.sfgOutput.trim() === canonicalSfg ? (
+                      <span className="block text-[10px] text-[var(--text-success)] truncate" title={canonicalSfg}>
+                        ✓ Canonical SFG
+                      </span>
+                    ) : (
+                      <span className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)] min-w-0">
+                        <span className="truncate" title={canonicalSfg}>
+                          Canonical: {canonicalSfg}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setField(i, { sfgOutput: canonicalSfg })}
+                          className="shrink-0 text-[var(--aws-link)] hover:underline font-semibold"
+                        >
+                          Use
+                        </button>
+                      </span>
+                    )
+                  ) : null}
                 </div>
                 <div className="flex items-center gap-0.5 shrink-0">
-                  <button type="button" onClick={() => move(i, i - 1)} disabled={i === 0} aria-label="Move up" className={iconBtn}>
+                  <button type="button" onClick={() => move(i, i - 1)} disabled={i === 0 || liveEdit} aria-label="Move up" className={iconBtn}>
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><polyline points="6 15 12 9 18 15" /></svg>
                   </button>
-                  <button type="button" onClick={() => move(i, i + 1)} disabled={i === steps.length - 1} aria-label="Move down" className={iconBtn}>
+                  <button type="button" onClick={() => move(i, i + 1)} disabled={i === steps.length - 1 || liveEdit} aria-label="Move down" className={iconBtn}>
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
                   </button>
                   <button type="button" onClick={() => remove(i)} disabled={steps.length <= 1} aria-label="Remove process" className={[iconBtn, "hover:text-[var(--aws-error)]"].join(" ")}>
@@ -1814,71 +2353,104 @@ function PreviewKV({ label, value, mono }: { label: string; value?: string | num
   );
 }
 
-function PreviewLinesList({ lines }: { lines: PlanLineRow[] }) {
+// A plan step is a "packing" step when its stored stage reads as packing, or —
+// for older rows without a stage token — when the process classifies as the
+// terminal FG/packaging bucket. Everything else is a WIP process. This mirrors
+// the backend's is_packing_stage tokenisation (job_card_v2.py).
+function isPackingStep(s: PlanStepRow): boolean {
+  const stage = (s.stage || "").toLowerCase();
+  if (stage.includes("pack")) return true;
+  return classifyProcess(s.process_name).stageBucket === STAGE_FINAL_FG;
+}
+
+// One labelled stage group (WIP processes / Packing) rendered as ordered rows of
+// "process — floor", matching the Create-Job-Card wizard's stage layout so the
+// expanded plan row reads the same as the job-card view.
+function StageGroup({
+  label, tone, steps,
+}: {
+  label: string;
+  tone: "wip" | "pack";
+  steps: PlanStepRow[];
+}) {
+  if (steps.length === 0) return null;
+  const dot = tone === "pack" ? "bg-[#9a393e]" : "bg-[var(--aws-orange-active)]";
   return (
-    <>
-      {/* Mobile (< sm): stacked rows */}
-      <ul className="sm:hidden space-y-1.5">
-        {lines.map((l) => (
-          <li key={l.plan_line_id} className="border border-[var(--aws-border)] rounded bg-white px-2 py-1.5">
-            <div className="text-[12px] font-semibold text-[var(--text-primary)] truncate" title={l.fg_sku_name ?? ""}>
-              {l.fg_sku_name || "—"}
-            </div>
-            <div className="text-[10px] uppercase tracking-wide font-semibold text-[var(--text-muted)] truncate">
-              {l.customer_name || "—"}
-            </div>
-            <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[11px] mt-1">
-              <span className="font-semibold">{fmtPlanKg(l.planned_qty_kg)} kg</span>
-              {l.planned_qty_units != null ? <span className="text-[var(--text-muted)]">{l.planned_qty_units} pcs</span> : null}
-              {l.area ? <span className="text-[var(--text-secondary)]">@ {l.area}</span> : null}
-              {l.deadline_date ? <span className="text-[var(--text-muted)]">· {fmtPlanDate(l.deadline_date)}</span> : null}
-              {l.steps && l.steps.length > 0 ? (
-                <span className="text-[10px] font-semibold text-[var(--text-secondary)] bg-[var(--surface-subtle)] border border-[var(--aws-border)] rounded-sm px-1 py-0">
-                  {l.steps.length} steps
-                </span>
-              ) : null}
-            </div>
+    <div>
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <span className={["inline-block w-1.5 h-1.5 rounded-full", dot].join(" ")} />
+        <span className="text-[10px] uppercase tracking-wide font-bold text-[var(--text-muted)]">{label}</span>
+        <span className="text-[10px] text-[var(--text-muted)]">· {steps.length}</span>
+      </div>
+      <ol className="space-y-0.5">
+        {steps.map((s, i) => (
+          <li
+            key={s.step_id ?? `${label}-${i}`}
+            className="flex items-baseline gap-2 text-[11px] leading-[15px] pl-3"
+          >
+            <span className="font-mono text-[10px] text-[var(--text-muted)] w-4 shrink-0 text-right">{i + 1}.</span>
+            <span className="text-[var(--text-primary)] truncate" title={s.process_name ?? ""}>
+              {s.process_name || "—"}
+            </span>
+            <span className="text-[var(--text-muted)]">·</span>
+            <span className={s.floor ? "text-[var(--text-secondary)]" : "text-[var(--text-muted)] italic"}>
+              {s.floor || "floor not set"}
+            </span>
           </li>
         ))}
-      </ul>
-      {/* sm+: table */}
-      <div className="hidden sm:block bg-white border border-[var(--aws-border)] rounded overflow-hidden">
-        <table className="w-full text-[11px] border-collapse">
-          <thead className="bg-[var(--surface-subtle)] text-[var(--text-muted)]">
-            <tr>
-              <th className="px-2 py-1 text-left text-[10px] font-bold uppercase tracking-wide">FG SKU</th>
-              <th className="px-2 py-1 text-left text-[10px] font-bold uppercase tracking-wide">Customer</th>
-              <th className="px-2 py-1 text-right text-[10px] font-bold uppercase tracking-wide">Qty (kg)</th>
-              <th className="px-2 py-1 text-right text-[10px] font-bold uppercase tracking-wide">Pcs</th>
-              <th className="px-2 py-1 text-left text-[10px] font-bold uppercase tracking-wide">Floor / Area</th>
-              <th className="px-2 py-1 text-left text-[10px] font-bold uppercase tracking-wide">Deadline</th>
-              <th className="px-2 py-1 text-right text-[10px] font-bold uppercase tracking-wide">Steps</th>
-            </tr>
-          </thead>
-          <tbody>
-            {lines.map((l) => {
-              const stepsWithFloor = (l.steps ?? []).filter((s) => !!s.floor).length;
-              return (
-                <tr key={l.plan_line_id} className="border-t border-[var(--aws-border)]">
-                  <td className="px-2 py-1 max-w-[220px] truncate" title={l.fg_sku_name ?? ""}>{l.fg_sku_name || "—"}</td>
-                  <td className="px-2 py-1 max-w-[180px] truncate" title={l.customer_name ?? ""}>{l.customer_name || "—"}</td>
-                  <td className="px-2 py-1 text-right font-mono">{fmtPlanKg(l.planned_qty_kg)}</td>
-                  <td className="px-2 py-1 text-right font-mono">{l.planned_qty_units ?? "—"}</td>
-                  <td className="px-2 py-1 text-[var(--text-secondary)]">{l.area || "—"}</td>
-                  <td className="px-2 py-1 text-[var(--text-secondary)] whitespace-nowrap">
-                    {l.deadline_date ? fmtPlanDate(l.deadline_date) : "—"}
-                  </td>
-                  <td className="px-2 py-1 text-right font-mono">
-                    {l.steps?.length ?? 0}
-                    {stepsWithFloor > 0 ? <span className="text-[10px] text-[var(--text-muted)] ml-1">({stepsWithFloor} floored)</span> : null}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </>
+      </ol>
+    </div>
+  );
+}
+
+// Per-line process route grouped into WIP processes + Packing — the same shape
+// the operator sees in Create/Edit Job Card.
+function LineStageBreakdown({ steps }: { steps?: PlanStepRow[] | null }) {
+  const ordered = [...(steps ?? [])].sort(
+    (a, b) => (a.step_order ?? 0) - (b.step_order ?? 0),
+  );
+  if (ordered.length === 0) {
+    return <p className="text-[10px] text-[var(--text-muted)] italic mt-1">No process route on this line yet.</p>;
+  }
+  const wip = ordered.filter((s) => !isPackingStep(s));
+  const pack = ordered.filter((s) => isPackingStep(s));
+  return (
+    <div className="mt-1.5 space-y-1.5">
+      <StageGroup label="WIP processes" tone="wip" steps={wip} />
+      <StageGroup label="Packing" tone="pack" steps={pack} />
+    </div>
+  );
+}
+
+// Lines preview — stacked cards at every width so each line can show its full
+// WIP → Packing breakdown (not just a step count).
+function PreviewLinesList({ lines }: { lines: PlanLineRow[] }) {
+  return (
+    <ul className="space-y-1.5">
+      {lines.map((l) => (
+        <li key={l.plan_line_id} className="border border-[var(--aws-border)] rounded bg-white px-2.5 py-2">
+          <div className="flex items-start justify-between gap-2 flex-wrap">
+            <div className="min-w-0">
+              <div className="text-[12px] font-semibold text-[var(--text-primary)] truncate" title={l.fg_sku_name ?? ""}>
+                {l.fg_sku_name || "—"}
+              </div>
+              <div className="text-[10px] uppercase tracking-wide font-semibold text-[var(--text-muted)] truncate">
+                {l.customer_name || "—"}
+              </div>
+            </div>
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[11px] justify-end">
+              <span className="font-semibold whitespace-nowrap">{fmtPlanKg(l.planned_qty_kg)} kg</span>
+              {l.planned_qty_units != null ? (
+                <span className="text-[var(--text-muted)] whitespace-nowrap">{fmtPlanUnits(l.planned_qty_units)} pcs</span>
+              ) : null}
+              {l.area ? <span className="text-[var(--text-secondary)] whitespace-nowrap">@ {l.area}</span> : null}
+              {l.deadline_date ? <span className="text-[var(--text-muted)] whitespace-nowrap">· {fmtPlanDate(l.deadline_date)}</span> : null}
+            </div>
+          </div>
+          <LineStageBreakdown steps={l.steps} />
+        </li>
+      ))}
+    </ul>
   );
 }
 

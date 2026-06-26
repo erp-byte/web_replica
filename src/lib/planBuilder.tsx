@@ -959,15 +959,24 @@ function SelectedCard({
   // the two fields stay unlinked and the operator types both.
   const skuUomKg: number | null = skuUomFromMaster;
 
+  // Both setters clamp to the available pending qty (item 6). The typed field
+  // is already clamped by NumberField's `max`, but the DERIVED field needs its
+  // own clamp: skuUomKg is the master pack-weight, which can differ from the
+  // line's own pending kg/pcs ratio, so e.g. (max pcs × master uom) can land
+  // above the available kg. Clamp the computed counterpart too so neither
+  // field can ever exceed what's actually pending.
   function patchQtyUnits(n: number | undefined) {
     if (n == null || !Number.isFinite(n)) {
       onPatch({ qty_units: undefined, qty_kg: undefined });
       return;
     }
+    const units = defaultUnits > 0 ? Math.min(n, defaultUnits) : n;
     if (skuUomKg != null) {
-      onPatch({ qty_units: n, qty_kg: Number((n * skuUomKg).toFixed(3)) });
+      let kg = Number((units * skuUomKg).toFixed(3));
+      if (defaultKg > 0 && kg > defaultKg) kg = defaultKg;
+      onPatch({ qty_units: units, qty_kg: kg });
     } else {
-      onPatch({ qty_units: n });
+      onPatch({ qty_units: units });
     }
   }
   function patchQtyKg(n: number | undefined) {
@@ -975,10 +984,13 @@ function SelectedCard({
       onPatch({ qty_kg: undefined, qty_units: undefined });
       return;
     }
+    const kg = defaultKg > 0 ? Math.min(n, defaultKg) : n;
     if (skuUomKg != null && skuUomKg > 0) {
-      onPatch({ qty_kg: n, qty_units: Math.round(n / skuUomKg) });
+      let units = Math.round(kg / skuUomKg);
+      if (defaultUnits > 0 && units > defaultUnits) units = Math.round(defaultUnits);
+      onPatch({ qty_kg: kg, qty_units: units });
     } else {
-      onPatch({ qty_kg: n });
+      onPatch({ qty_kg: kg });
     }
   }
 
@@ -1714,18 +1726,22 @@ function NumberField({
         inputMode="decimal"
         value={display}
         placeholder={placeholder}
+        // Mouse-wheel over a focused number input silently increments the
+        // value — blur on wheel so an accidental scroll can't corrupt the
+        // pack count / qty. The .no-spinner class hides the up/down arrows.
+        onWheel={(e) => e.currentTarget.blur()}
         onChange={(e) => {
           const raw = e.target.value;
           if (raw === "") { onChange(undefined); return; }
           const n = parseFloat(raw);
           if (!Number.isFinite(n)) { onChange(undefined); return; }
-          // Clamp to max when supplied — the planning page binds this to
-          // the SO line's pending qty so operators can't over-plan.
+          // Clamp to max when supplied — bound to the SO line's available
+          // pending qty so operators can't over-plan (item 6).
           const clamped = max != null && max > 0 && n > max ? max : n;
           onChange(clamped);
         }}
         className={[
-          "w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border outline-none focus:shadow-[0_0_0_1px_#9a393e]",
+          "no-spinner w-full h-8 px-2 text-[13px] rounded-[2px] bg-white border outline-none focus:shadow-[0_0_0_1px_#9a393e]",
           overMax
             ? "border-[var(--aws-error)] focus:border-[var(--aws-error)]"
             : "border-[var(--aws-border-strong)] focus:border-[#9a393e]",

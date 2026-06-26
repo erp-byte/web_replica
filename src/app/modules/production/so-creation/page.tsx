@@ -219,9 +219,12 @@ function downloadBlob(blob: Blob, filename: string): void {
 }
 
 const STATUS_PALETTE: Record<string, { fg: string; bg: string; ring: string }> = {
+  // Three-colour GST status scheme — green = ok, amber = warning, red =
+  // mismatch (matches the per-line LineCard chip). Warning was previously a
+  // maroon (#9a393e) too close to the mismatch red to read as distinct.
   ok:        { fg: "var(--text-success)", bg: "#eaf6ed", ring: "#b6dbb1" },
   mismatch:  { fg: "#b1361e",             bg: "#fdf3f1", ring: "#f0c7be" },
-  warning:   { fg: "#9a393e",             bg: "#fbeced", ring: "#e6bcbe" },
+  warning:   { fg: "#8a5a00",             bg: "#fef6e7", ring: "#f3d28a" },
   unmatched: { fg: "var(--text-muted)",   bg: "var(--surface-disabled)", ring: "var(--aws-border)" },
 };
 
@@ -239,8 +242,9 @@ export default function SoCreationPage() {
   // floor pickers, same as the planning page.
   const scope = useUserScope();
 
-  // Method picker visibility — once the operator commits to upload, hide it.
-  const [showMethods, setShowMethods] = useState(true);
+  // Upload drop-zone visibility. SOs are upload-only now (manual creation was
+  // removed) so there's no method picker — a header "Upload Excel" button
+  // toggles the drop zone directly.
   const [uploadOpen, setUploadOpen] = useState(false);
 
   // ── Cache hydration ────────────────────────────────────────────────────
@@ -297,6 +301,12 @@ export default function SoCreationPage() {
   // carry company ("CFPL"/"CDPL"), so a single-select All/CFPL/CDPL segmented
   // control in the header drives the `company` filter. "" = All.
   const [company, setCompany] = useState<string>(cache?.company ?? "");
+  // Fulfillment-availability filter — "" = All, "pending" = available qty > 0,
+  // "fulfilled" = synced but nothing left pending. A separate dimension from
+  // the GST status chips, so it gets its own toolbar control + wire param.
+  const [fulfillment, setFulfillment] = useState<"" | "pending" | "fulfilled">(
+    cache?.fulfillment ?? "",
+  );
   // Planning-parity top-level toolbar filters (Customer / SO / Article) — each
   // a prominent multi-select dropdown mirroring the planning page's filter bar,
   // kept separate from advFilters (own cache keys) rather than buried in the
@@ -509,6 +519,7 @@ export default function SoCreationPage() {
       dateTo,
       advFilters: advArrays,
       company,
+      fulfillment,
       customer,
       soNumber,
       article,
@@ -528,7 +539,7 @@ export default function SoCreationPage() {
     // (which would trip the exhaustive-deps rule). `company` is a plain string
     // so it goes in directly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, status, dateFrom, dateTo, company, advKey, customerKey, soNumberKey, articleKey, sortBy, sortOrder, page, expandedKey, selectionKey]);
+  }, [search, status, dateFrom, dateTo, company, fulfillment, advKey, customerKey, soNumberKey, articleKey, sortBy, sortOrder, page, expandedKey, selectionKey]);
 
   // Fetch effect ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -551,6 +562,7 @@ export default function SoCreationPage() {
             date_to: dateTo || undefined,
             ...serialiseAdvFilters(advFilters),
             company: company || undefined,
+            fulfillment_status: fulfillment || undefined,
             customer_name: customer.length ? customer.join(",") : undefined,
             so_number: soNumber.length ? soNumber.join(",") : undefined,
             article: article.length ? article.join(",") : undefined,
@@ -573,11 +585,18 @@ export default function SoCreationPage() {
     // wiring the Set map itself into the dep array (which would trip the
     // exhaustive-deps rule).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authed, page, debouncedSearch, status, sortBy, sortOrder, dateFrom, dateTo, company, advKey, customerKey, soNumberKey, articleKey]);
+  }, [authed, page, debouncedSearch, status, sortBy, sortOrder, dateFrom, dateTo, company, fulfillment, advKey, customerKey, soNumberKey, articleKey]);
 
   // Status chip change resets page. Same as filter changes in the listing.
   function changeStatus(s: StatusChip) {
     setStatus(s);
+    setPage(1);
+  }
+
+  // Fulfillment-availability filter (Pending / Fulfilled). Clicking the active
+  // chip toggles it back off; resets pagination like every other filter.
+  function changeFulfillment(f: "pending" | "fulfilled") {
+    setFulfillment((cur) => (cur === f ? "" : f));
     setPage(1);
   }
 
@@ -658,6 +677,8 @@ export default function SoCreationPage() {
         sort_order: sortOrder,
         date_from: dateFrom || undefined,
         date_to: dateTo || undefined,
+        company: company || undefined,
+        fulfillment_status: fulfillment || undefined,
         ...serialiseAdvFilters(advFilters),
       });
       const sos = resp.sales_orders ?? [];
@@ -722,22 +743,47 @@ export default function SoCreationPage() {
       <div className="mb-3">
         <BackLink parentHref="/modules/production" label="production" />
       </div>
-      <div className="mb-5 flex items-start justify-between gap-3">
-        <div>
+      <div className="mb-5 flex flex-wrap items-start gap-3">
+        <div className="min-w-0">
           <h1 className="text-[22px] leading-[28px] font-semibold text-[var(--text-primary)]">SO Creation</h1>
           <p className="text-[13px] text-[var(--text-secondary)] mt-1">
-            Create Sales Orders manually or upload a Sales Register file.
+            Upload a Sales Register file to create and reconcile Sales Orders.
           </p>
         </div>
         {/* Entity scope (company) — mirrors the planning page's entity selector;
             "" = All, else filters so_header.company to CFPL/CDPL. The Create
             Plan button mirrors planning's header CTA: orange, disabled with no
             selection or while a plan is in flight. */}
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => { setUploadOpen((v) => !v); setUploadMsg(null); }}
+            className={[
+              "h-8 px-3 text-[12px] rounded-[2px] border inline-flex items-center gap-1.5",
+              uploadOpen
+                ? "border-[var(--aws-orange)] text-[var(--aws-orange)] bg-[#fbeced]"
+                : "border-[var(--aws-border-strong)] bg-white text-[var(--text-primary)] hover:border-[var(--aws-navy)]",
+            ].join(" ")}
+            title="Upload a Sales Register .xlsx to bulk-process Sales Orders"
+          >
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            Upload Excel
+          </button>
           <EntitySelector value={company} onChange={onEntityChange} />
           <button
             type="button"
-            onClick={async () => { if (await pb.onCreatePlan()) clearLineSelection(); }}
+            onClick={async () => {
+              if (await pb.onCreatePlan()) {
+                clearLineSelection();
+                // Creating a plan reserves the linked fulfillment qty server-side
+                // (planned_qty↑ ⇒ pending_qty↓, a GENERATED column). Bump the sync
+                // version so every expanded SO's pending effect refetches and the
+                // pack count / qty (kg) visibly drop without a manual Sync (item 3).
+                setSyncVersion((v) => v + 1);
+              }
+            }}
             disabled={pb.creatingPlan || pb.selectedIds.size === 0}
             className="h-8 px-3 text-[12px] rounded-[2px] font-semibold border bg-[var(--aws-orange)] border-[var(--aws-orange-active)] hover:bg-[var(--aws-orange-hover)] text-white disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
           >
@@ -754,13 +800,6 @@ export default function SoCreationPage() {
         </div>
       </div>
 
-      {showMethods ? (
-        <MethodPicker
-          onUpload={() => { setShowMethods(false); setUploadOpen(true); }}
-          onManual={() => router.push("/modules/production/so-creation/manual")}
-        />
-      ) : null}
-
       {uploadOpen ? (
         <UploadZone
           uploading={uploading}
@@ -768,11 +807,10 @@ export default function SoCreationPage() {
           message={uploadMsg}
           onChosen={onFileChosen}
           onCancel={() => {
-            // Close the drop zone, restore the method picker, and wipe any
-            // stale feedback so the next entry starts clean. Disabled while
-            // an upload is in-flight (button is hidden in that case).
+            // Close the drop zone and wipe any stale feedback so the next
+            // entry starts clean. Disabled while an upload is in-flight
+            // (button is hidden in that case).
             setUploadOpen(false);
-            setShowMethods(true);
             setUploadMsg(null);
             setUploadFileName("");
           }}
@@ -784,6 +822,8 @@ export default function SoCreationPage() {
         onSearch={setSearch}
         status={status}
         onStatus={changeStatus}
+        fulfillment={fulfillment}
+        onFulfillment={changeFulfillment}
         summary={data?.summary}
         dateFrom={dateFrom}
         dateTo={dateTo}
@@ -810,6 +850,7 @@ export default function SoCreationPage() {
         onClearAllFilters={() => {
           setSearch("");
           setStatus("all");
+          setFulfillment("");
           setDateFrom("");
           setDateTo("");
           setAdvFilters({});
@@ -935,40 +976,6 @@ export default function SoCreationPage() {
   );
 }
 
-// ── Method picker ────────────────────────────────────────────────────────
-
-function MethodPicker({
-  onUpload, onManual,
-}: { onUpload: () => void; onManual: () => void }) {
-  return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-5">
-      <MethodCard
-        title="Upload Excel"
-        desc="Upload a Sales Register .xlsx file to bulk-process Sales Orders and run GST reconciliation."
-        onClick={onUpload}
-      />
-      <MethodCard
-        title="Create Manually"
-        desc="Enter SO header details and line items step by step with a guided form."
-        onClick={onManual}
-      />
-    </div>
-  );
-}
-
-function MethodCard({ title, desc, onClick }: { title: string; desc: string; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="text-left bg-white border border-[var(--aws-border)] rounded-md shadow-[0_1px_1px_rgba(0,28,36,0.18)] p-4 hover:border-[var(--aws-navy)] hover:shadow-[0_2px_6px_rgba(0,28,36,0.18)] transition focus:outline-none focus:border-[#9a393e] focus:shadow-[0_0_0_2px_#9a393e]"
-    >
-      <div className="text-[14px] font-semibold text-[var(--text-primary)] mb-1">{title}</div>
-      <p className="text-[12px] text-[var(--text-secondary)]">{desc}</p>
-    </button>
-  );
-}
-
 // ── Upload zone ──────────────────────────────────────────────────────────
 
 function UploadZone({
@@ -1061,7 +1068,7 @@ function UploadZone({
 // ── Toolbar ──────────────────────────────────────────────────────────────
 
 function Toolbar({
-  search, onSearch, status, onStatus, summary,
+  search, onSearch, status, onStatus, fulfillment, onFulfillment, summary,
   dateFrom, dateTo, onDateChange,
   advFilters, onAdvToggle, onAdvClear,
   customer, onCustomerChange,
@@ -1076,6 +1083,8 @@ function Toolbar({
   onSearch: (v: string) => void;
   status: StatusChip;
   onStatus: (s: StatusChip) => void;
+  fulfillment: "" | "pending" | "fulfilled";
+  onFulfillment: (f: "pending" | "fulfilled") => void;
   summary?: import("@/lib/so").SoSummary;
   dateFrom: string;
   dateTo: string;
@@ -1103,21 +1112,22 @@ function Toolbar({
   const advCount = countAdvFilters(advFilters);
   const dateActive = !!dateFrom || !!dateTo;
   const statusActive = status !== "all";
+  const fulfillmentActive = fulfillment !== "";
   const searchActive = search.trim().length > 0;
   const customerActive = customer.length > 0;
   const soNumberActive = soNumber.length > 0;
   const articleActive = article.length > 0;
-  const hasAnyFilter = advCount > 0 || dateActive || statusActive || searchActive
+  const hasAnyFilter = advCount > 0 || dateActive || statusActive || fulfillmentActive || searchActive
     || customerActive || soNumberActive || articleActive;
   const activeFilterCount =
-    advCount + (dateActive ? 1 : 0) + (statusActive ? 1 : 0) + (searchActive ? 1 : 0)
+    advCount + (dateActive ? 1 : 0) + (statusActive ? 1 : 0) + (fulfillmentActive ? 1 : 0) + (searchActive ? 1 : 0)
     + (customerActive ? 1 : 0) + (soNumberActive ? 1 : 0) + (articleActive ? 1 : 0);
 
   const chips: { value: StatusChip; label: string; count?: number; tone?: string }[] = [
     { value: "all",       label: "All" },
     { value: "ok",        label: "OK",        count: summary?.so_ok,        tone: "var(--text-success)" },
     { value: "mismatch",  label: "Mismatch",  count: summary?.so_mismatch,  tone: "#b1361e" },
-    { value: "warning",   label: "Warning",   count: summary?.so_warning,   tone: "#9a393e" },
+    { value: "warning",   label: "Warning",   count: summary?.so_warning,   tone: "#8a5a00" },
     { value: "unmatched", label: "Unmatched", count: summary?.so_unmatched, tone: "var(--text-muted)" },
   ];
 
@@ -1154,6 +1164,43 @@ function Toolbar({
               style={{
                 background: status === c.value ? "rgba(255,255,255,0.18)" : "var(--surface-disabled)",
                 color: status === c.value ? "white" : (c.tone ?? "var(--text-secondary)"),
+              }}
+            >
+              {c.count}
+            </span>
+          ) : null}
+          {c.label}
+        </button>
+      ))}
+
+      {/* Fulfillment-availability filters — Pending SO (any line with pending
+          qty > 0) and Fulfilled SO (synced, nothing left pending). A separate
+          dimension from the GST chips above, so they're grouped behind a thin
+          divider and toggle independently. */}
+      <span className="self-stretch w-px bg-[var(--aws-border)] mx-0.5" aria-hidden />
+      {([
+        { value: "pending" as const,   label: "Pending SO",   count: summary?.so_pending,   tone: "#8a5a00" },
+        { value: "fulfilled" as const, label: "Fulfilled SO", count: summary?.so_fulfilled, tone: "var(--text-success)" },
+      ]).map((c) => (
+        <button
+          key={c.value}
+          type="button"
+          onClick={() => onFulfillment(c.value)}
+          aria-pressed={fulfillment === c.value}
+          className={[
+            "h-8 px-3 text-[12px] rounded-full border transition-colors flex items-center gap-1.5",
+            fulfillment === c.value
+              ? "bg-[var(--aws-navy)] text-white border-[var(--aws-navy)]"
+              : "bg-white text-[var(--text-primary)] border-[var(--aws-border-strong)] hover:border-[var(--aws-navy)]",
+          ].join(" ")}
+          title={c.value === "pending" ? "SOs with quantity still available to plan" : "SOs fully planned / dispatched — nothing pending"}
+        >
+          {c.count != null ? (
+            <span
+              className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] rounded-full font-bold"
+              style={{
+                background: fulfillment === c.value ? "rgba(255,255,255,0.18)" : "var(--surface-disabled)",
+                color: fulfillment === c.value ? "white" : c.tone,
               }}
             >
               {c.count}
@@ -1967,7 +2014,7 @@ function GstSegBar({ row }: { row: SoRow }) {
     <div className="flex flex-col gap-1" title={tooltip}>
       <div className="flex h-1.5 w-[120px] rounded-full overflow-hidden bg-[var(--surface-divider)]">
         {okPct        > 0 ? <span style={{ width: `${okPct}%`,        background: "var(--text-success)" }} /> : null}
-        {warnPct      > 0 ? <span style={{ width: `${warnPct}%`,      background: "#9a393e" }} /> : null}
+        {warnPct      > 0 ? <span style={{ width: `${warnPct}%`,      background: "#8a5a00" }} /> : null}
         {errPct       > 0 ? <span style={{ width: `${errPct}%`,       background: "#b1361e" }} /> : null}
         {unmatchedPct > 0 ? <span style={{ width: `${unmatchedPct}%`, background: "var(--text-muted)" }} /> : null}
       </div>
@@ -2219,7 +2266,7 @@ function SectionShell({ title, children }: { title: string; children: React.Reac
 function KV({ label, value, mono, accent }: { label: string; value: React.ReactNode; mono?: boolean; accent?: "ok" | "warn" | "err" }) {
   const colour =
     accent === "ok"   ? "text-[var(--text-success)]" :
-    accent === "warn" ? "text-[#9a393e]" :
+    accent === "warn" ? "text-[#8a5a00]" :
     accent === "err"  ? "text-[#b1361e]" :
                         "text-[var(--text-primary)]";
   return (
@@ -2435,7 +2482,7 @@ function CompareRow({
   const tone =
     cls === "pass" ? "text-[var(--text-success)]" :
     cls === "fail" ? "text-[#b1361e]" :
-                     "text-[#9a393e]";
+                     "text-[#8a5a00]";
   return (
     <tr className="border-b border-[var(--aws-border)]">
       <td className="px-2 py-1 font-semibold text-[var(--text-secondary)]">{label}</td>
@@ -2482,7 +2529,7 @@ function ValidationChecks({ line, gst, seesCost }: { line: SoLine; gst: GstRecon
     <div className="space-y-1.5">
       {checks.map((c, i) => {
         const icon = c.pass ? "✓" : c.warn ? "⚠" : "✗";
-        const tone = c.pass ? "text-[var(--text-success)]" : c.warn ? "text-[#9a393e]" : "text-[#b1361e]";
+        const tone = c.pass ? "text-[var(--text-success)]" : c.warn ? "text-[#8a5a00]" : "text-[#b1361e]";
         return (
           <div key={i} className="flex items-start gap-2 text-[12px]">
             <span className={["font-bold w-4 shrink-0", tone].join(" ")}>{icon}</span>

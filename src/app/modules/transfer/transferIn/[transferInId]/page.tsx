@@ -94,7 +94,10 @@ export default function TransferInViewPage() {
     return out;
   }, [data]);
 
-  if (!allowed) return null;
+  // No `if (!allowed) return null` gate: useRequireAuth returns true on the server but
+  // false on the client's first render, so gating the render on it causes a hydration
+  // mismatch. The body reads data null-safely (data?.boxes ?? []); effects are gated on
+  // `allowed` and the hook redirects unauthenticated users.
 
   const boxes = data?.boxes ?? [];
   const totalBoxes = boxes.length;

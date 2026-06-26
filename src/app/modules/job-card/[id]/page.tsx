@@ -36,6 +36,8 @@ import { lockBannerId, useLockState, userMayForceUnlock } from "../_useLockState
 // C10 / C11 (Wave 4) — canonical role-gated action button + amendments tab.
 import { ActionButton, LockableButton } from "../_ActionButton";
 import { AmendmentsTab } from "../_AmendmentsTab";
+import { RawMaterialTab } from "./_RawMaterialTab";
+import { OutputTab } from "./_OutputTab";
 // W4-MED-3/M10 — single subscription via context (see _UserContext.tsx).
 import { UserProvider } from "../_UserContext";
 
@@ -296,12 +298,14 @@ type JobCardDetail = {
 // Materials + Shifts (which existed on the web prototype) intentionally don't
 // have Android counterparts; the equivalent info lives inside Accounting
 // (BOM articles, consumption) and the toolbar/header time strip respectively.
-type TabKey = "chain" | "overview" | "accounting" | "quality" | "signoffs" | "remarks" | "sfgboxes" | "amendments";
+type TabKey = "chain" | "rawmaterial" | "overview" | "accounting" | "output" | "quality" | "signoffs" | "remarks" | "sfgboxes" | "amendments";
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "chain",      label: "Stage Chain" },
+  { key: "rawmaterial", label: "Raw Material" },
   { key: "overview",   label: "Overview" },
-  { key: "accounting", label: "Output & Accounting" },
+  { key: "accounting", label: "Accounting" },
+  { key: "output",     label: "Output" },
   { key: "quality",    label: "Quality" },
   { key: "signoffs",   label: "Sign-offs" },
   { key: "remarks",    label: "Remarks" },
@@ -839,7 +843,7 @@ function JobCardDetailPageBody() {
           <span>/</span>
           <button onClick={() => router.push("/modules/job-card")} className="hover:underline">Job Cards</button>
           <span>/</span>
-          <span className="text-white">{detail?.job_card_number ?? jcId}</span>
+          <span className="text-white">{detail?.job_card_id ?? jcId}</span>
         </nav>
         <div className="flex-1" />
         <button
@@ -894,7 +898,7 @@ function JobCardDetailPageBody() {
               >
                 <strong>Job card not started.</strong> Assign a team on the{" "}
                 <em>Overview</em> tab and click <strong>START</strong> to enable
-                Output &amp; Accounting, Quality, and Remarks.
+                Output, Accounting, Quality, and Remarks.
               </div>
             ) : null}
             {/* R13 — the batch-closure controls + table now live inside the
@@ -931,7 +935,10 @@ function PageHeader({
   onReload: () => void;
 }) {
   const style = STATUS_STYLES[detail.status ?? ""] ?? STATUS_STYLES.unlocked;
-  const jcNum = detail.job_card_number || `JC-${detail.job_card_id}`;
+  // Show the 8-digit JC number (job_card_id). The long PLAN-… job_card_number
+  // reference stays on the tooltip for traceability.
+  const jcNum = String(detail.job_card_id);
+  const jcRef = detail.job_card_number || "";
   const sos = detail.section_1_product?.so_numbers ?? detail.so_numbers ?? [];
   const soDisplay = sos.length === 0 ? "—" : sos.length === 1 ? sos[0] : `${sos[0]} +${sos.length - 1}`;
 
@@ -946,7 +953,7 @@ function PageHeader({
     <div className="bg-white border border-[var(--aws-border)] rounded-md shadow-[0_1px_1px_rgba(0,28,36,0.18)] p-5 mb-4">
       <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
         <div className="min-w-0">
-          <div className="font-mono text-[12px] text-[var(--aws-link)] font-semibold mb-1" title={jcNum}>{jcNum}</div>
+          <div className="font-mono text-[12px] text-[var(--aws-link)] font-semibold mb-1" title={jcRef || jcNum}>{jcNum}</div>
           <h1 className="text-[22px] leading-[26px] font-semibold text-[var(--text-primary)]" title={detail.fg_sku_name ?? ""}>
             {detail.fg_sku_name || "—"}
           </h1>
@@ -2247,14 +2254,23 @@ function StatusPill({ status, small }: { status: string | null; small?: boolean 
 
 function TabStrip({ value, onChange }: { value: TabKey; onChange: (t: TabKey) => void }) {
   return (
-    <div className="border-b border-[var(--aws-border)] mb-4 flex gap-1 overflow-x-auto">
+    // Adaptive across devices: the row scrolls horizontally when the tabs
+    // overflow (phones) and lays out fully on wider screens. Tabs never shrink
+    // so labels stay readable; the scrollbar is hidden for a clean strip and
+    // touch momentum scrolling kicks in natively.
+    <div
+      role="tablist"
+      className="border-b border-[var(--aws-border)] mb-4 flex flex-nowrap gap-1 overflow-x-auto [-webkit-overflow-scrolling:touch] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+    >
       {TABS.map((t) => {
         const active = t.key === value;
         return (
           <button
             key={t.key}
+            role="tab"
+            aria-selected={active}
             onClick={() => onChange(t.key)}
-            className={["px-4 py-2 text-[13px] font-medium whitespace-nowrap border-b-2 -mb-px transition", active ? "border-[var(--aws-orange)] text-[var(--text-primary)]" : "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]"].join(" ")}
+            className={["shrink-0 px-3 sm:px-4 py-2 text-[12px] sm:text-[13px] font-medium whitespace-nowrap border-b-2 -mb-px transition", active ? "border-[var(--aws-orange)] text-[var(--text-primary)]" : "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]"].join(" ")}
           >
             {t.label}
           </button>
@@ -2275,8 +2291,10 @@ function TabPanel({
 }) {
   switch (tab) {
     case "chain":      return <StageChainTab chain={chain} detail={detail} onJump={onJumpJc} />;
+    case "rawmaterial": return <RawMaterialTab jcId={detail.job_card_id} />;
     case "overview":   return <OverviewTab detail={detail} chain={chain} onReload={onReload} />;
     case "accounting": return <AccountingTab detail={detail} onReload={onReload} />;
+    case "output":     return <OutputTab detail={detail} onReload={onReload} />;
     case "quality":    return <QualityTab detail={detail} onReload={onReload} />;
     case "signoffs":   return <SignOffsTab detail={detail} onReload={onReload} />;
     case "remarks":    return <RemarksTab detail={detail} onReload={onReload} />;
@@ -2292,15 +2310,16 @@ function TabPanel({
 // rejected. box_id is the 8-digit numeric QR payload.
 
 type SfgBoxRow = {
-  box_id: number;
+  box_id: number;            // carton_id aliased AS box_id by the backend (mig 067)
   sfg_code: string | null;
-  box_number: number;
-  total_boxes: number;
   net_weight: number;
   gross_weight: number | null;
   status: string;
   received_into_job_card_id: number | null;
-  // Phase-7 genealogy additions (additive/optional; backend may not send yet)
+  // Optional / phase-7 genealogy additions. box_number/total_boxes/lot_number
+  // were dropped from sfg_box in mig 067, so the backend no longer returns them.
+  box_number?: number;
+  total_boxes?: number;
   lot_number?: string | null;
   parent_box_id?: number | null;
 };
@@ -2477,25 +2496,19 @@ function SfgBoxesTab({ detail }: { detail: JobCardDetail }) {
                 {boxes.length} box(es) · Σ {boxes.reduce((s, b) => s + Number(b.net_weight), 0).toFixed(3)} kg
               </div>
               <div className="grid grid-cols-12 gap-2 text-[11px] text-[var(--text-muted)] font-semibold">
-                <div className="col-span-3">Box ID</div>
-                <div className="col-span-1">#</div>
-                <div className="col-span-2">Net kg</div>
-                <div className="col-span-2">Lot</div>
+                <div className="col-span-4">Box ID</div>
+                <div className="col-span-3">Net kg</div>
                 <div className="col-span-2">Parent</div>
-                <div className="col-span-2">Status</div>
+                <div className="col-span-3">Status</div>
               </div>
               {boxes.map((b) => (
                 <div key={b.box_id} className="grid grid-cols-12 gap-2 text-[12px] items-center">
-                  <div className="col-span-3 font-mono">{b.box_id}</div>
-                  <div className="col-span-1">{b.box_number}/{b.total_boxes}</div>
-                  <div className="col-span-2">{Number(b.net_weight).toFixed(3)}</div>
-                  <div className="col-span-2 truncate">
-                    {b.lot_number ? <LotChip lot={b.lot_number} /> : <span className="text-[var(--text-muted)]">—</span>}
-                  </div>
+                  <div className="col-span-4 font-mono">{b.box_id}</div>
+                  <div className="col-span-3">{Number(b.net_weight).toFixed(3)}</div>
                   <div className="col-span-2 font-mono">
                     {b.parent_box_id != null ? b.parent_box_id : <span className="text-[var(--text-muted)]">—</span>}
                   </div>
-                  <div className="col-span-2 truncate">{b.status}</div>
+                  <div className="col-span-3 truncate">{b.status}</div>
                 </div>
               ))}
               <button type="button" className={`${btnCls} mt-2`} onClick={() => void openLabels()}>
@@ -6716,7 +6729,7 @@ function QualityTab({ detail, onReload }: { detail: JobCardDetail; onReload: () 
       {/* ── 5. QC Sample (read-only summary; R10/C6) ──────────────────── */}
       <Panel title="QC Sample">
         <p className="text-[11px] text-[var(--text-muted)] italic mb-3">
-          Recorded on the Output &amp; Accounting tab. Read-only here.
+          Recorded on the Accounting tab. Read-only here.
         </p>
         <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2">
           <KV

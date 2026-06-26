@@ -221,15 +221,6 @@ function fmtBatch(v: number | string | null | undefined): string {
   return `${n.toLocaleString("en-IN")} kg`;
 }
 
-// JC numbers are long alphanumeric strings (e.g. JC-CFPL-2025-0001234).
-// Cards have less horizontal real estate than table rows, so show a compact
-// suffix view; the full number remains available via the title tooltip.
-function shortJc(full: string): string {
-  if (full.length <= 12) return full;
-  const tail = full.slice(-8);
-  return `…${tail}`;
-}
-
 // A plan line can bundle multiple SOs; the card has room for one cell. Show
 // the first SO with a "+N" suffix to signal there are more, and pass the
 // full comma-separated list as a tooltip via the Meta `title` override.
@@ -999,7 +990,7 @@ function JobCardTable({ rows, onReload }: { rows: JobCardRow[]; onReload: () => 
             <th className="px-3 py-2 text-left text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] hidden lg:table-cell">Plant</th>
             <th className="px-3 py-2 text-left text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] hidden lg:table-cell">Stage</th>
             <th className="px-3 py-2 text-left text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Status</th>
-            <th className="px-3 py-2 text-left text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] hidden xl:table-cell">Lock</th>
+            <th className="px-3 py-2 text-left text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] hidden lg:table-cell">Floor</th>
             <th className="px-3 py-2 text-left text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] hidden md:table-cell">Plan Date</th>
             <th className="px-3 py-2 text-left text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] hidden xl:table-cell">Created</th>
             <th className="px-3 py-2 text-right text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Action</th>
@@ -1017,15 +1008,12 @@ function JobCardTable({ rows, onReload }: { rows: JobCardRow[]; onReload: () => 
 
 function JobCardTableRow({ jc, onReload }: { jc: JobCardRow; onReload: () => void }) {
   const router = useRouter();
-  // W4-MED-3/M10 — pure derivation off the context-provided me snapshot.
-  const { me } = useUserCtx();
-  const lock = useMemo(
-    () => deriveRowLockIndicator(jc, userMayForceUnlock(me)),
-    [jc, me],
-  );
   const status = jc.status ?? "";
   const style = STATUS_STYLES[status] ?? { bg: "#f4f4f4", fg: "#414d5c", ring: "#d5dbdb" };
-  const jcNum = jc.job_card_number || `JC-${jc.job_card_id}`;
+  // Show the 8-digit JC number (job_card_id). The long PLAN-… job_card_number
+  // reference is kept on the title tooltip for traceability.
+  const jcNum = String(jc.job_card_id);
+  const jcRef = jc.job_card_number || "";
   const so = formatSo(jc.so_numbers);
 
   function openDetail() {
@@ -1035,7 +1023,7 @@ function JobCardTableRow({ jc, onReload }: { jc: JobCardRow; onReload: () => voi
 
   return (
     <tr className="border-b border-[var(--aws-border)] hover:bg-[var(--surface-subtle)]">
-      <td className="px-3 py-2 font-mono text-[11px] text-[var(--aws-link)] truncate max-w-[160px]" title={jcNum}>
+      <td className="px-3 py-2 font-mono text-[11px] text-[var(--aws-link)] truncate max-w-[160px]" title={jcRef || jcNum}>
         <button type="button" onClick={openDetail} className="hover:underline">
           {jcNum}
         </button>
@@ -1070,17 +1058,8 @@ function JobCardTableRow({ jc, onReload }: { jc: JobCardRow; onReload: () => voi
           {fmtStatus(status) || "—"}
         </span>
       </td>
-      <td className="px-3 py-2 hidden xl:table-cell">
-        {lock.isLocked ? (
-          <span
-            className="text-[10px] font-semibold px-1.5 py-0.5 rounded-sm border bg-[#fdf3f1] text-[#b1361e] border-[#f0c7be]"
-            title={lock.lockedReason ? `Locked: ${lock.lockedReason.replace(/_/g, " ")}` : "Locked"}
-          >
-            Locked
-          </span>
-        ) : (
-          <span className="text-[10px] text-[var(--text-muted)]">—</span>
-        )}
+      <td className="px-3 py-2 text-[var(--text-secondary)] hidden lg:table-cell truncate max-w-[140px]" title={jc.floor ?? ""}>
+        {jc.floor || "—"}
       </td>
       <td className="px-3 py-2 text-[var(--text-primary)] font-medium hidden md:table-cell">
         {fmtPlanDate(jc.plan_date)}
@@ -1259,20 +1238,14 @@ function JobCard({ jc, onReload }: { jc: JobCardRow; onReload: () => void }) {
     fg: "#414d5c",
     ring: "#d5dbdb",
   };
-  const jcNum = jc.job_card_number || `JC-${jc.job_card_id}`;
-  const jcShort = shortJc(jcNum);
+  // Show the 8-digit JC number (job_card_id). The long PLAN-… job_card_number
+  // reference is kept on the title tooltip for traceability.
+  const jcNum = String(jc.job_card_id);
+  const jcRef = jc.job_card_number || "";
   // v2 returns planned_qty_kg; v1 returns batch_size_kg — accept either.
   const qty = jc.planned_qty_kg ?? jc.batch_size_kg;
   const plant = jc.factory ?? "—";
   const so = formatSo(jc.so_numbers);
-  // C2 (Wave 4) — per-row lock indicator. The pure derivation reads only
-  // {status, lock_reason, force_unlocked} off the row + the force-unlock
-  // capability bit (computed once from the UserCtx-provided me snapshot).
-  const { me } = useUserCtx();
-  const lock = useMemo(
-    () => deriveRowLockIndicator(jc, userMayForceUnlock(me)),
-    [jc, me],
-  );
 
   function openDetail() {
     patchListCache({ scrollY: typeof window !== "undefined" ? window.scrollY : 0 });
@@ -1284,20 +1257,11 @@ function JobCard({ jc, onReload }: { jc: JobCardRow; onReload: () => void }) {
       <div className="flex items-start justify-between gap-2 mb-2">
         <span
           className="font-mono text-[12px] font-semibold text-[var(--aws-link)] truncate"
-          title={jcNum}
+          title={jcRef || jcNum}
         >
-          {jcShort}
+          {jcNum}
         </span>
         <div className="flex items-center gap-1 shrink-0">
-          {lock.isLocked ? (
-            <span
-              className="text-[10px] font-semibold px-1.5 py-0.5 rounded-sm border bg-[#fdf3f1] text-[#b1361e] border-[#f0c7be]"
-              title={lock.lockedReason ? `Locked: ${lock.lockedReason.replace(/_/g, " ")}` : "Locked"}
-            >
-              {/* Lock icon character (Unicode padlock) keeps the chip narrow */}
-              ⚿ Locked
-            </span>
-          ) : null}
           <span
             className="inline-block text-[10px] font-semibold px-2 py-0.5 rounded-sm capitalize whitespace-nowrap border"
             style={{ background: style.bg, color: style.fg, borderColor: style.ring }}

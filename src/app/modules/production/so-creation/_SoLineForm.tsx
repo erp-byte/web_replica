@@ -412,7 +412,10 @@ function Field({
       <input
         type={type}
         step={type === "number" ? "any" : undefined}
-        className={inputCls}
+        // Hide the spinner arrows and blur on wheel for number fields so a
+        // stray mouse-wheel scroll can't silently change the value.
+        className={type === "number" ? `${inputCls} no-spinner` : inputCls}
+        onWheel={type === "number" ? (e) => e.currentTarget.blur() : undefined}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         disabled={disabled}

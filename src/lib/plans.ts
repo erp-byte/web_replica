@@ -237,14 +237,29 @@ export async function createLineJobCards(
 // Current job-card config for a line, shaped to prefill the Edit wizard.
 // exists=false ⇒ no cards yet (Create); editable=false ⇒ a stage already
 // started, so it can't be replaced.
+export interface LineJobCardConfigStep {
+  job_card_id?: number | null;
+  process?: string | null;
+  floor?: string | null;
+  sfg_output?: string | null;
+  status?: string | null;
+  started?: boolean;
+}
+
 export interface LineJobCardConfig {
   exists: boolean;
+  // Canonical SFG name for this line's FG (SFG canonicalization design §5.4);
+  // null when the FG has no SFG (plain repack / hamper / RM) or isn't catalogued.
+  canonical_sfg?: string | null;
   editable?: boolean;
   started?: boolean;
   qty_kg?: number | null;
   qty_units?: number | null;
-  wip_steps?: { process?: string | null; floor?: string | null; sfg_output?: string | null }[];
+  wip_steps?: LineJobCardConfigStep[];
   pkg_floor?: string | null;
+  pkg_job_card_id?: number | null;
+  pkg_status?: string | null;
+  pkg_started?: boolean;
 }
 
 export async function fetchLineJobCardConfig(
@@ -255,6 +270,35 @@ export async function fetchLineJobCardConfig(
     throw new Error(await readApiErrorMessage(res, `Load job card HTTP ${res.status}`));
   }
   return (await res.json()) as LineJobCardConfig;
+}
+
+// One canonical-SFG typeahead suggestion (SFG canonicalization design §5.4).
+export interface CanonicalSfgSuggestion {
+  sfg_name: string;
+  fg_count: number;
+  fg_salegroup?: string | null;
+}
+
+// Typeahead over the canonical SFG catalogue (sfg_canonical_map). Returns []
+// on empty term or any error so the picker degrades to plain free text.
+export async function searchCanonicalSfg(
+  q: string,
+  entity?: string | null,
+  limit = 20,
+  signal?: AbortSignal,
+): Promise<CanonicalSfgSuggestion[]> {
+  const term = q.trim();
+  if (!term) return [];
+  const p = new URLSearchParams({ q: term, limit: String(limit) });
+  if (entity) p.set("entity", entity);
+  try {
+    const res = await apiFetch(`/api/v1/production/sfg-canonical/search?${p}`, { signal });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { results?: CanonicalSfgSuggestion[] };
+    return data.results ?? [];
+  } catch {
+    return [];
+  }
 }
 
 // Edit = replace the line's job cards (delete + recreate). Refused server-side
@@ -271,6 +315,141 @@ export async function replaceLineJobCards(
     throw new Error(await readApiErrorMessage(res, `Edit job card HTTP ${res.status}`));
   }
   return (await res.json()) as CreateJobCardResult;
+}
+
+// ── Live edit (constrained, started-chain) ───────────────────────────────
+//
+// Unlike replaceLineJobCards (full delete+recreate, blocked once started),
+// apply-edits works on a started chain: floor + qty change anytime, add a
+// process in the un-started tail, and remove a process (force-records the JC's
+// data then cancels it). Qty changes sync to the linked SO (ledger + so_line).
+// Existing steps carry job_card_id; new ones omit it. Any existing WIP
+// job_card_id absent from `steps` is treated as a removal.
+
+export interface ApplyEditsStep {
+  job_card_id?: number | null;
+  process: string;
+  floor: string;
+  sfg_output?: string | null;
+}
+
+export interface ApplyEditsBody {
+  qty_kg: number;
+  qty_units?: number | null;
+  steps: ApplyEditsStep[];
+  pkg_floor: string;
+  pkg_job_card_id?: number | null;
+  remove_reasons?: Record<string, string>;
+}
+
+export interface ApplyEditsResult {
+  plan_id: number;
+  plan_line_id: number;
+  job_card_ids: number[];
+  removed: number;
+  added: number;
+  floors_changed: number;
+  qty_changed: boolean;
+  so_sync?: {
+    synced: boolean;
+    fulfillment_ids?: number[];
+    so_line_ids?: number[];
+    delta_kg?: number;
+    delta_units?: number;
+    so_lines?: { so_line_id: number; new_kg: number; new_pcs: number }[];
+  };
+}
+
+export async function applyLiveJobCardEdits(
+  planLineId: number,
+  body: ApplyEditsBody,
+): Promise<ApplyEditsResult> {
+  const res = await apiFetch(
+    `/api/v1/production/plans-v2/lines/${planLineId}/job-cards/apply-edits`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, `Apply job-card edits HTTP ${res.status}`));
+  }
+  return (await res.json()) as ApplyEditsResult;
+}
+
+// ── FG Dispatch (completed packaging stage → notify billing/ops/stores) ──────
+//
+// dispatch-info prefills the modal: the packaging (FG) job card + its batches
+// (the batch selector, defaulting to the packaging stage — never another WIP
+// process). dispatch sends the email (To billing/candor_operations/store_head,
+// CC business_head/operations_head/inventory_manager/production_manager) and
+// records it. num_boxes / customer_location / transport fields are operator-
+// entered (no stored source).
+
+export interface DispatchBatch {
+  batch_id: number;
+  batch_number: number;
+  batch_date?: string | null;
+  status?: string | null;
+  qty_kg: number;
+  qty_units: number;
+}
+
+export interface LineDispatchInfo {
+  exists: boolean;
+  message?: string;
+  plan_id?: number;
+  plan_line_id?: number;
+  job_card_id?: number;
+  job_card_number?: string;
+  fg_sku_name?: string;
+  customer_name?: string | null;
+  warehouse?: string | null;
+  floor?: string | null;
+  uom?: string | null;
+  packaging_status?: string;
+  packaging_completed?: boolean;
+  batches?: DispatchBatch[];
+  to_roles?: string[];
+  cc_roles?: string[];
+}
+
+export async function fetchLineDispatchInfo(planLineId: number): Promise<LineDispatchInfo> {
+  const res = await apiFetch(`/api/v1/production/plans-v2/lines/${planLineId}/dispatch-info`);
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, `Dispatch info HTTP ${res.status}`));
+  }
+  return (await res.json()) as LineDispatchInfo;
+}
+
+export interface DispatchBody {
+  batch_id: number;
+  num_boxes?: number | null;
+  customer_location?: string | null;
+  vehicle_number?: string | null;
+  transporter?: string | null;
+  transport_location?: string | null;
+}
+
+export interface DispatchResult {
+  dispatched: boolean;
+  dispatch_id: number;
+  email_sent: boolean;
+  to: string[];
+  cc: string[];
+  subject: string;
+  body: string;
+}
+
+export async function createLineDispatch(
+  planLineId: number,
+  body: DispatchBody,
+): Promise<DispatchResult> {
+  const res = await apiFetch(
+    `/api/v1/production/plans-v2/lines/${planLineId}/dispatch`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, `Dispatch HTTP ${res.status}`));
+  }
+  return (await res.json()) as DispatchResult;
 }
 
 // ── Update (partial) ────────────────────────────────────────────────────
@@ -609,6 +788,14 @@ export function fmtPlanKg(v: number | string | null | undefined): string {
   const n = typeof v === "number" ? v : parseFloat(v);
   if (Number.isNaN(n)) return "—";
   return n.toLocaleString("en-IN", { maximumFractionDigits: 1 });
+}
+
+// Whole-piece (pcs) total — units are counts, so no decimals.
+export function fmtPlanUnits(v: number | string | null | undefined): string {
+  if (v == null || v === "") return "—";
+  const n = typeof v === "number" ? v : parseFloat(v);
+  if (Number.isNaN(n)) return "—";
+  return Math.round(n).toLocaleString("en-IN", { maximumFractionDigits: 0 });
 }
 
 export function fmtPlanDate(iso?: string | null): string {

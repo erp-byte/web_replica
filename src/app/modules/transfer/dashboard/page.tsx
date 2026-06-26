@@ -253,7 +253,10 @@ export default function TransferDashboardPage() {
     URL.revokeObjectURL(url);
   }, [filtered]);
 
-  if (!allowed) return null;
+  // No `if (!allowed) return null` gate: useRequireAuth returns true on the server but
+  // false on the client's first render, so gating the render on it causes a hydration
+  // mismatch. The `hasAccess` guard below already protects the body; effects are gated on
+  // `allowed` and the hook redirects unauthenticated users.
 
   if (!hasAccess) {
     return (

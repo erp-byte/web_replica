@@ -115,6 +115,11 @@ export interface SoSummary {
   so_mismatch?: number;
   so_warning?: number;
   so_unmatched?: number;
+  // Fulfillment-availability counters backing the Pending / Fulfilled chips.
+  // so_pending = SOs with any line still having pending qty; so_fulfilled =
+  // SOs with fulfillment rows but none pending.
+  so_pending?: number;
+  so_fulfilled?: number;
 }
 
 export interface SoFilterOptions {
@@ -173,6 +178,10 @@ export interface SoListQuery {
   // Article (so_line.sku_name) multi-select — comma-joined values, OR within
   // the field, matching the planning page's "All Articles" filter.
   article?: string;
+  // Fulfillment-availability filter. "pending" = SOs with any line whose
+  // pending_qty_kg > 0; "fulfilled" = SOs that have fulfillment rows but none
+  // pending. Independent of the GST `status` filter (a different dimension).
+  fulfillment_status?: "pending" | "fulfilled";
 }
 
 export function buildListParams(q: SoListQuery): URLSearchParams {

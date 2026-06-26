@@ -25,6 +25,10 @@ export interface SoListCache {
   advFilters: Record<string, string[]>;
   // Entity scope (so_header.company) — header segmented control; "" = All.
   company: string;
+  // Fulfillment-availability filter — toolbar segmented control. "" = All,
+  // "pending" = available qty > 0, "fulfilled" = no pending left. Optional +
+  // defaulted so pre-existing cache entries stay valid.
+  fulfillment?: "" | "pending" | "fulfilled";
   // Planning-parity top-level toolbar filters — kept separate from advFilters
   // so each persists/rehydrates as its own array.
   customer: string[];

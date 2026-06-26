@@ -36,7 +36,7 @@ import {
   fmtPlanDate,
   fmtDateRange,
 } from "@/lib/plans";
-import { PROCESS_OPTIONS, canonProcess, stageFromProcess } from "@/lib/processCatalog";
+import { PROCESS_OPTIONS, canonProcess, stageFromProcess, classifyProcess, STAGE_FINAL_FG } from "@/lib/processCatalog";
 import { normaliseWarehouseCode } from "@/lib/warehouseScope";
 
 // Warehouse → allowed floor list. Same source-of-truth as the Planning
@@ -742,7 +742,9 @@ function LineCard({
         />
       </dl>
 
-      {/* ── Zone 3: read-only steps table ────────────────────────── */}
+      {/* ── Zone 3: read-only steps, grouped WIP → Packing ───────────
+          Same WIP/Packing stage layout the operator sees in Create/Edit
+          Job Card, so an opened plan reads identically to a job card. */}
       {steps.length > 0 ? (
         <div>
           <div className="px-3 pt-2 pb-1 flex items-center justify-between">
@@ -757,10 +759,49 @@ function LineCard({
               <span className="text-[10px] text-[var(--aws-error)]">No floors set</span>
             )}
           </div>
-          <StepsTable steps={steps} />
+          <StageGroupedSteps steps={steps} />
         </div>
       ) : null}
     </li>
+  );
+}
+
+// A plan step is "packing" when its stored stage reads as packing, or — for
+// older rows without a stage token — when the process classifies as the
+// terminal FG/packaging bucket. Mirrors job_card_v2.py is_packing_stage.
+function isPackingStep(s: PlanStepRow): boolean {
+  const stage = (s.stage || "").toLowerCase();
+  if (stage.includes("pack")) return true;
+  return classifyProcess(s.process_name).stageBucket === STAGE_FINAL_FG;
+}
+
+// Read-only steps split into WIP processes + Packing, each as its own labelled
+// StepsTable so an opened plan matches the Create/Edit Job Card WIP/Packing view.
+function StageGroupedSteps({ steps }: { steps: PlanStepRow[] }) {
+  const ordered = [...steps].sort((a, b) => (a.step_order ?? 0) - (b.step_order ?? 0));
+  const wip = ordered.filter((s) => !isPackingStep(s));
+  const pack = ordered.filter((s) => isPackingStep(s));
+  return (
+    <div className="space-y-2 pb-1">
+      {wip.length > 0 ? (
+        <div>
+          <div className="px-3 py-0.5 flex items-center gap-1.5">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--aws-orange-active)]" />
+            <span className="text-[10px] uppercase tracking-wide font-bold text-[var(--text-muted)]">WIP processes · {wip.length}</span>
+          </div>
+          <StepsTable steps={wip} />
+        </div>
+      ) : null}
+      {pack.length > 0 ? (
+        <div>
+          <div className="px-3 py-0.5 flex items-center gap-1.5">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#9a393e]" />
+            <span className="text-[10px] uppercase tracking-wide font-bold text-[var(--text-muted)]">Packing · {pack.length}</span>
+          </div>
+          <StepsTable steps={pack} />
+        </div>
+      ) : null}
+    </div>
   );
 }
 

@@ -77,6 +77,16 @@ function inDateRange(day: string, from: string, to: string): boolean {
   if (!day) return false;
   return (!from || day >= from) && (!to || day <= to);
 }
+// Display formatter for transfer dates: pass through DD-MM-YYYY (the backend's
+// strftime format), reformat anything else, 'N/A' for empty. Mirrors the
+// reference dashboard's formatDate.
+function formatDate(d?: string | null): string {
+  const s = (d || "").trim();
+  if (!s) return "N/A";
+  if (/^\d{2}-\d{2}-\d{4}$/.test(s)) return s;
+  const dt = new Date(s);
+  return isNaN(dt.getTime()) ? s : dt.toLocaleDateString("en-GB").replace(/\//g, "-");
+}
 
 type TabKey = "request" | "transferout" | "transferin" | "innercold" | "details";
 
@@ -326,6 +336,22 @@ export default function TransferDashboardPage() {
     ])
   ), [transferIns, transferInStatus, transferInDateFrom, transferInDateTo, warehouseFilter, warehouseDir, transferInSearch]);
 
+  // ── Incoming Material: dispatched transfer-OUTs that have no GRN started yet.
+  //    A created transfer-out shows here automatically; once receiving begins it
+  //    moves to the GRN list below (Resume), and once finalized it shows there as
+  //    Received. "Material In" opens the interactive receive page for that transfer.
+  const grnOutIds = useMemo(
+    () => new Set(transferIns.map((ti) => ti.transfer_out_id)), [transferIns]);
+  const filteredIncoming = useMemo(() => transfers.filter((t) => {
+    const s = (t.status || "").toLowerCase();
+    return s !== "received" && s !== "completed" && !grnOutIds.has(t.id) &&
+      inDateRange(dmyToISO(t.stock_trf_date), transferInDateFrom, transferInDateTo) &&
+      warehouseMatchesDir(warehouseFilter, warehouseDir, [t.from_warehouse, t.from_cold_unit], [t.to_warehouse]) &&
+      searchMatch(transferInSearch, [
+        t.challan_no, t.from_warehouse, t.to_warehouse, t.from_cold_unit, t.stock_trf_date, t.vehicle_no,
+      ]);
+  }), [transfers, grnOutIds, transferInDateFrom, transferInDateTo, warehouseFilter, warehouseDir, transferInSearch]);
+
   const pendingRequests = useMemo(
     () => requests.filter((r) => r.status === "Pending").length, [requests]);
 
@@ -370,7 +396,10 @@ export default function TransferDashboardPage() {
 
   const go = (path: string) => router.push(`/modules/transfer${path}`);
 
-  if (!allowed) return null;
+  // No `if (!allowed) return null` gate: useRequireAuth returns true on the server but
+  // false on the client's first render, so gating the render on it causes a hydration
+  // mismatch. The `isAdmin` guard below already protects the body; effects are gated on
+  // `allowed` and the hook redirects unauthenticated users.
 
   if (!isAdmin) {
     return (
@@ -498,9 +527,9 @@ export default function TransferDashboardPage() {
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 mb-4">
         <StatCard label="Requests" value={requestsTotal} tone="text-[var(--text-primary)]" />
         <StatCard label="Pending" value={pendingRequests} tone="text-amber-600" />
-        <StatCard label="Transfers Out" value={transfersTotal} tone="text-sky-700" />
-        <StatCard label="Transfers In" value={transferInsTotal} tone="text-emerald-700" />
-        <StatCard label="In Transit" value={inTransitCount} tone="text-violet-700" onClick={() => setPendingOpen(true)} />
+        <StatCard label="Transfers Out" value={transfersTotal} tone="text-violet-700" />
+        <StatCard label="Transfers In" value={transferInsTotal} tone="text-teal-700" />
+        <StatCard label="In Transit" value={inTransitCount} tone="text-orange-600" onClick={() => setPendingOpen(true)} />
       </div>
 
       {/* Tabs */}
@@ -582,12 +611,24 @@ export default function TransferDashboardPage() {
 
           {/* Transfer In */}
           {activeTab === "transferin" && (
+            <>
+            {/* Filters / search / actions stay at the top of the tab. Search, date and
+                warehouse filter BOTH lists below; the All/Pending/Received segment
+                applies to the GRN records. */}
+            <div className="flex flex-wrap items-center gap-2 mb-3">
+              {TransferInStatusFilter}
+              {DateRange(transferInDateFrom, setTransferInDateFrom, transferInDateTo, setTransferInDateTo, () => setTransferInsPage(1))}
+              {SearchBox(transferInSearch, setTransferInSearch, "Search…")}{WarehouseSelect}
+            </div>
+
+            <IncomingMaterial rows={filteredIncoming} go={go} />
+
+            <div className="bg-white border border-[var(--aws-border)] rounded-md">
+              <div className="px-4 py-3 border-b border-[var(--aws-border)] text-[13px] font-semibold text-[var(--text-primary)]">
+                Transfer-In Records ({filteredTransferIns.length})
+              </div>
+              <div className="p-3">
             <Section
-              filterBar={<>{TransferInStatusFilter}
-                {DateRange(transferInDateFrom, setTransferInDateFrom, transferInDateTo, setTransferInDateTo, () => setTransferInsPage(1))}
-                {SearchBox(transferInSearch, setTransferInSearch, "Search GRNs…")}{WarehouseSelect}
-                <button onClick={() => go("/transferIn")}
-                  className="px-3 py-1 text-[12px] rounded bg-[var(--aws-navy)] text-white">Create Transfer IN</button></>}
               empty={filteredTransferIns.length === 0}
               emptyMsg="No transfer-ins found."
               pagination={<PaginationBar page={tiPage} totalPages={transferInsTP} total={filteredTransferIns.length} onPage={setTransferInsPage} />}
@@ -629,6 +670,9 @@ export default function TransferDashboardPage() {
                 ))}
               </div>
             </Section>
+              </div>
+            </div>
+            </>
           )}
 
           {/* Inner Cold */}
@@ -715,12 +759,15 @@ function innerColdHoverLines(c: InnerColdChallan): HoverLine[] {
 }
 
 // ── Row/section building blocks ──────────────────────────────────────────
-function RowBtn({ children, onClick, disabled, danger }: {
-  children: React.ReactNode; onClick?: () => void; disabled?: boolean; danger?: boolean;
+function RowBtn({ children, onClick, disabled, danger, primary }: {
+  children: React.ReactNode; onClick?: () => void; disabled?: boolean; danger?: boolean; primary?: boolean;
 }) {
   return (
     <button onClick={onClick} disabled={disabled}
-      className={`ml-1 px-2 py-0.5 text-[11px] border rounded disabled:opacity-40 ${danger ? "border-rose-300 text-rose-700 hover:bg-rose-50" : "border-[var(--aws-border)] hover:border-[var(--aws-navy)]"}`}>
+      className={`ml-1 px-2 py-0.5 text-[11px] border rounded disabled:opacity-40 ${
+        danger ? "border-rose-300 text-rose-700 hover:bg-rose-50"
+          : primary ? "border-[var(--aws-navy)] bg-[var(--aws-navy)] text-white hover:opacity-90"
+            : "border-[var(--aws-border)] hover:border-[var(--aws-navy)]"}`}>
       {children}
     </button>
   );
@@ -750,6 +797,20 @@ function CardRow({ children }: { children: React.ReactNode }) {
 function CardActions({ children }: { children: React.ReactNode }) {
   return <div className="mt-2 flex flex-wrap gap-1">{children}</div>;
 }
+// Items + total-qty badge pair shown in the Transfer-Out "Items/Boxes" column,
+// mirroring the reference dashboard.
+function ItemsBadges({ items, qty }: { items: number; qty: number }) {
+  return (
+    <span className="inline-flex items-center gap-1 flex-wrap">
+      <span className="px-1.5 py-0.5 rounded text-[11px] bg-blue-50 text-blue-700 border border-blue-200">
+        {items} Item{items !== 1 ? "s" : ""}
+      </span>
+      <span className="px-1.5 py-0.5 rounded text-[11px] bg-amber-50 text-amber-700 border border-amber-200">
+        Qty: {qty || 0}
+      </span>
+    </span>
+  );
+}
 
 function TransferTable({ rows, go, canDelete, onDelete, showActions }: {
   rows: TransferListItem[]; go: (p: string) => void; canDelete: boolean; onDelete: (id: number) => void; showActions: boolean;
@@ -757,29 +818,89 @@ function TransferTable({ rows, go, canDelete, onDelete, showActions }: {
   return (
     <table className="hidden md:table w-full text-[12px]">
       <thead><tr className="text-left text-[var(--text-secondary)] border-b border-[var(--aws-border)]">
-        <th className="py-2">Challan</th><th>From</th><th>To</th><th>Date</th><th>Boxes</th><th>Status</th><th></th>
+        <th className="py-2">Challan</th><th>Status</th><th>Route</th><th>Date</th><th>Vehicle</th><th>Items/Boxes</th><th></th>
       </tr></thead>
       <tbody>
         {rows.map((t) => (
           <tr key={t.id} className="border-b border-[var(--aws-border)]/50">
             <td className="py-2 font-medium">
-              <ChallanHoverCard label={t.challan_no} from={t.from_cold_unit || t.from_warehouse} to={t.to_warehouse}
+              <ChallanHoverCard label={t.challan_no} from={displayWarehouse(t.from_warehouse)} to={displayWarehouse(t.to_warehouse)}
                 fetchLines={() => TransferApi.getTransfer(t.id).then(transferHoverData)} />
             </td>
-            <td>{t.from_cold_unit || t.from_warehouse}</td><td>{t.to_warehouse}</td>
-            <td>{t.stock_trf_date}</td><td>{t.boxes_count}</td>
             <td><StatusBadge status={t.status} /></td>
+            <td className="whitespace-nowrap">{displayWarehouse(t.from_warehouse)} → {displayWarehouse(t.to_warehouse)}</td>
+            <td>{formatDate(t.stock_trf_date)}</td>
+            <td>
+              {t.vehicle_no || "—"}
+              {t.driver_name && <span className="block text-[11px] text-[var(--text-secondary)]">{t.driver_name}</span>}
+            </td>
+            <td><ItemsBadges items={t.items_count} qty={t.total_qty} /></td>
             <td className="text-right whitespace-nowrap">
               <RowBtn onClick={() => go(`/view/${t.id}`)}>View</RowBtn>
-              <RowBtn onClick={() => go(`/dc/${t.id}`)}>DC</RowBtn>
               {showActions && <RowBtn disabled={["received", "completed"].includes((t.status || "").toLowerCase())}
                 onClick={() => go(`/directtransferform?editId=${t.id}`)}>Edit</RowBtn>}
+              <RowBtn onClick={() => go(`/dc/${t.id}`)}>DC</RowBtn>
               {showActions && canDelete && <RowBtn danger onClick={() => onDelete(t.id)}>Delete</RowBtn>}
             </td>
           </tr>
         ))}
       </tbody>
     </table>
+  );
+}
+
+// Incoming Material — dispatched transfer-OUTs awaiting receipt. "Material In"
+// opens the interactive receive page (/transferIn?resume=<challan>) pre-loaded
+// with that transfer-out's details.
+function IncomingMaterial({ rows, go }: { rows: TransferListItem[]; go: (p: string) => void }) {
+  if (rows.length === 0) return null;
+  const receive = (t: TransferListItem) => go(`/transferIn?resume=${encodeURIComponent(t.challan_no)}`);
+  return (
+    <div className="bg-white border border-[var(--aws-border)] rounded-md mb-4">
+      <div className="px-4 py-3 border-b border-[var(--aws-border)] flex items-center justify-between">
+        <span className="text-[13px] font-semibold text-[var(--text-primary)]">Incoming Material ({rows.length})</span>
+        <span className="text-[11px] text-[var(--text-secondary)]">Dispatched transfers awaiting receipt</span>
+      </div>
+      <table className="hidden md:table w-full text-[12px]">
+        <thead><tr className="text-left text-[var(--text-secondary)] border-b border-[var(--aws-border)]">
+          <th className="px-4 py-2">Challan</th><th>Route</th><th>Date</th><th>Vehicle</th><th>Items/Boxes</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody>
+          {rows.map((t) => (
+            <tr key={t.id} className="border-b border-[var(--aws-border)]/50">
+              <td className="px-4 py-2 font-mono font-medium">{t.challan_no}</td>
+              <td className="whitespace-nowrap">{displayWarehouse(t.from_warehouse)} → {displayWarehouse(t.to_warehouse)}</td>
+              <td>{formatDate(t.stock_trf_date)}</td>
+              <td>{t.vehicle_no || "—"}</td>
+              <td><ItemsBadges items={t.items_count} qty={t.total_qty} /></td>
+              <td><StatusBadge status={t.status} /></td>
+              <td className="text-right whitespace-nowrap">
+                <RowBtn onClick={() => go(`/view/${t.id}`)}>View</RowBtn>
+                <RowBtn primary onClick={() => receive(t)}>Transfer In</RowBtn>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="md:hidden p-3 space-y-2">
+        {rows.map((t) => (
+          <div key={t.id} className="border border-[var(--aws-border)] rounded-md p-2">
+            <div className="flex items-center justify-between">
+              <span className="font-mono text-[12px] font-medium">{t.challan_no}</span>
+              <StatusBadge status={t.status} />
+            </div>
+            <div className="text-[11px] text-[var(--text-secondary)]">
+              {displayWarehouse(t.from_warehouse)} → {displayWarehouse(t.to_warehouse)} · {formatDate(t.stock_trf_date)}
+            </div>
+            <div className="mt-1"><ItemsBadges items={t.items_count} qty={t.total_qty} /></div>
+            <div className="mt-2 flex flex-wrap gap-1">
+              <RowBtn onClick={() => go(`/view/${t.id}`)}>View</RowBtn>
+              <RowBtn primary onClick={() => receive(t)}>Transfer In</RowBtn>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -791,9 +912,12 @@ function TransferCards({ rows, go, canDelete, onDelete, showActions }: {
       {rows.map((t) => (
         <Card key={t.id}>
           <CardHead title={t.challan_no} status={t.status} />
-          <CardRow>{(t.from_cold_unit || t.from_warehouse)} → {t.to_warehouse} · {t.stock_trf_date} · {t.boxes_count} boxes</CardRow>
+          <CardRow>{displayWarehouse(t.from_warehouse)} → {displayWarehouse(t.to_warehouse)} · {formatDate(t.stock_trf_date)}{t.vehicle_no ? ` · ${t.vehicle_no}` : ""}</CardRow>
+          <div className="mt-1"><ItemsBadges items={t.items_count} qty={t.total_qty} /></div>
           <CardActions>
             <RowBtn onClick={() => go(`/view/${t.id}`)}>View</RowBtn>
+            {showActions && <RowBtn disabled={["received", "completed"].includes((t.status || "").toLowerCase())}
+              onClick={() => go(`/directtransferform?editId=${t.id}`)}>Edit</RowBtn>}
             <RowBtn onClick={() => go(`/dc/${t.id}`)}>DC</RowBtn>
             {showActions && canDelete && <RowBtn danger onClick={() => onDelete(t.id)}>Delete</RowBtn>}
           </CardActions>

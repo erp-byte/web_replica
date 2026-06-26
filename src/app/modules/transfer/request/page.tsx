@@ -107,8 +107,10 @@ export default function NewTransferRequestPage() {
   const router = useRouter();
   const allowed = useRequireAuth(router.replace);
 
-  const [requestNo] = useState(genRequestNo);
-  const [form, setForm] = useState({ request_date: todayDMY(), from_warehouse: "", to_warehouse: "", reason_description: "" });
+  // Seeded empty so the initial render is deterministic (genRequestNo()/todayDMY() read
+  // the wall clock and would mismatch between the SSR render and client hydration). Filled on mount below.
+  const [requestNo, setRequestNo] = useState("");
+  const [form, setForm] = useState({ request_date: "", from_warehouse: "", to_warehouse: "", reason_description: "" });
   const [rows, setRows] = useState<Row[]>(() => [{ uid: 0, data: { ...EMPTY_ARTICLE } }]);
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set([0]));
   const nextUid = useRef(1);
@@ -134,6 +136,17 @@ export default function NewTransferRequestPage() {
     })();
     return () => { off = true; };
   }, [allowed]);
+
+  // ── Seed clock-derived defaults on the client (avoids the SSR hydration mismatch). ──
+  // Deferred via setTimeout so the setState isn't synchronous in the effect body
+  // (react-hooks/set-state-in-effect).
+  useEffect(() => {
+    const id = setTimeout(() => {
+      setRequestNo(genRequestNo());
+      setForm((f) => ({ ...f, request_date: todayDMY() }));
+    }, 0);
+    return () => clearTimeout(id);
+  }, []);
 
   // ── row ops ──
   const patchRow = useCallback((uid: number, patch: Partial<Article>) => {
@@ -174,7 +187,9 @@ export default function NewTransferRequestPage() {
     }
   };
 
-  if (!allowed) return null;
+  // No `if (!allowed) return null` gate: useRequireAuth returns true on the server but
+  // false on the client's first render, so gating the render on it causes a hydration
+  // mismatch. Effects are gated on `allowed`; the hook redirects unauthenticated users.
 
   return (
     <TransferChrome title="New Transfer Request">

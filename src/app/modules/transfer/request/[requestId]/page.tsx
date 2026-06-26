@@ -65,7 +65,10 @@ export default function RequestViewPage() {
     queueMicrotask(() => { load(); });
   }, [allowed, load]);
 
-  if (!allowed) return null;
+  // No `if (!allowed) return null` gate: useRequireAuth returns true on the server but
+  // false on the client's first render, so gating the render on it causes a hydration
+  // mismatch. The loading/error guards below already protect the body; effects are gated
+  // on `allowed` and the hook redirects unauthenticated users.
 
   const back = (
     <button onClick={() => router.push("/modules/transfer")}

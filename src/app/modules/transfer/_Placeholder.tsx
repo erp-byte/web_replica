@@ -10,8 +10,10 @@ import { TransferChrome } from "./_chrome";
 
 export function TransferPlaceholder({ title, phase }: { title: string; phase: string }) {
   const router = useRouter();
-  const allowed = useRequireAuth(router.replace);
-  if (!allowed) return null;
+  // Call for the redirect side-effect only — no `if (!allowed) return null` gate, which
+  // would cause a hydration mismatch (useRequireAuth returns true on the server but false
+  // on the client's first render). The hook still redirects unauthenticated users.
+  useRequireAuth(router.replace);
   return (
     <TransferChrome title={title}>
       <div className="max-w-xl mx-auto text-center py-16">
